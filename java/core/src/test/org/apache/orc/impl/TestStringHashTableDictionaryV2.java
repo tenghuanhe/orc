@@ -25,7 +25,9 @@ import org.junit.jupiter.api.Test;
 import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 
@@ -509,6 +511,48 @@ public class TestStringHashTableDictionaryV2 {
   }
 
   // -------------------------------------------------------------------------
+  // maxFill safety: at least one empty slot guaranteed (fastutil pattern)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Verifies the fastutil {@code maxFill} invariant: even with a load factor
+   * of 1.0, the threshold is capped at {@code capacity - 1}, guaranteeing
+   * at least one permanently empty slot.  Without this cap, filling every
+   * slot and then looking up a missing key would cause an infinite probe loop.
+   *
+   * <p>With {@code loadFactor = 1.0} and {@code initialCapacity = 4}:
+   * capacity = 4, threshold must be {@code min(ceil(4 * 1.0), 3) = 3}.
+   * The table still resizes once the 3rd element is inserted, keeping the
+   * probe loop safe.
+   */
+  @Test
+  public void testLoadFactorOneDoesNotFillAllSlots() throws Exception {
+    // loadFactor=1.0: without the n-1 cap, threshold would equal capacity,
+    // allowing all slots to be occupied and causing an infinite probe loop.
+    StringHashTableDictionaryV2 dict = new StringHashTableDictionaryV2(4, 1.0f);
+
+    // Insert many distinct keys — none must cause an infinite loop.
+    final int COUNT = 200;
+    for (int i = 0; i < COUNT; i++) {
+      assertEquals(i, dict.add(new Text("key-" + i)));
+    }
+    assertEquals(COUNT, dict.size());
+
+    // All keys must be retrievable.
+    Text t = new Text();
+    for (int i = 0; i < COUNT; i++) {
+      dict.getText(t, i);
+      assertEquals("key-" + i, t.toString());
+    }
+
+    // Duplicate detection must still work.
+    for (int i = 0; i < COUNT; i++) {
+      assertEquals(i, dict.add(new Text("key-" + i)));
+    }
+    assertEquals(COUNT, dict.size());
+  }
+
+  // -------------------------------------------------------------------------
   // Resize overflow boundary
   // -------------------------------------------------------------------------
 
@@ -580,5 +624,391 @@ public class TestStringHashTableDictionaryV2 {
     // capacity must remain unchanged (no reallocation occurred).
     assertEquals(maximumCapacity, capField.getInt(dict),
         "capacity must remain MAXIMUM_CAPACITY after no-op resize");
+  }
+
+  // ==========================================================================
+  // Boundary condition tests (fastutil review + correctness invariants)
+  // ==========================================================================
+
+  /**
+   * Verifies {@code maxFill(n, f)} directly: result must equal
+   * {@code min(ceil(n * f), n - 1)} for a representative set of inputs.
+   *
+   * <p>The {@code n - 1} cap is the critical safety property: linear probing
+   * requires at least one permanently empty slot so that the probe loop
+   * terminates even for keys not present in the table.
+   */
+  @Test
+  public void testMaxFillFormulaViaReflection() throws Exception {
+    java.lang.reflect.Method maxFillMethod =
+        StringHashTableDictionaryV2.class.getDeclaredMethod("maxFill", int.class, float.class);
+    maxFillMethod.setAccessible(true);
+
+    // { n, f-bits-as-int, expected }
+    // f encoded as raw bits to avoid ambiguous literal widening
+    Object[][] cases = {
+        {  1, 0.75f,  0 },  // ceil(0.75)=1, but n-1=0 dominates
+        {  2, 0.75f,  1 },  // ceil(1.5)=2,  n-1=1 dominates
+        {  4, 0.75f,  3 },  // ceil(3.0)=3,  n-1=3 → min(3,3)=3
+        {  8, 0.75f,  6 },  // ceil(6.0)=6,  n-1=7 → 6
+        { 16, 0.75f, 12 },  // ceil(12.0)=12, n-1=15 → 12
+        {  4, 1.0f,   3 },  // ceil(4.0)=4,  n-1=3 dominates
+        {  4, 1.5f,   3 },  // ceil(6.0)=6,  n-1=3 dominates
+        {  8, 0.99f,  7 },  // ceil(7.92)=8, n-1=7 dominates
+        {  8, 1.0f,   7 },  // ceil(8.0)=8,  n-1=7 dominates
+        {  8, 2.0f,   7 },  // ceil(16.0)=16, n-1=7 dominates
+    };
+
+    for (Object[] c : cases) {
+      int n = (int) c[0]; float f = (float) c[1]; int expected = (int) c[2];
+      int result = (int) maxFillMethod.invoke(null, n, f);
+      assertEquals(expected, result,
+          "maxFill(" + n + ", " + f + ") should be " + expected);
+      // Critical invariant: at least one slot must remain permanently empty
+      assertTrue(result < n,
+          "maxFill must be strictly < n, but got result=" + result + " for n=" + n);
+    }
+  }
+
+  /**
+   * Verifies the {@code threshold < capacity} invariant after construction and
+   * after every resize, for several load-factor values including pathological
+   * ones (&ge; 1.0).
+   *
+   * <p>Without this invariant the probe loop in {@code add()} could spin forever
+   * when every slot is occupied and the target key is absent.
+   */
+  @Test
+  public void testThresholdAlwaysLessThanCapacity() throws Exception {
+    java.lang.reflect.Field threshField =
+        StringHashTableDictionaryV2.class.getDeclaredField("threshold");
+    threshField.setAccessible(true);
+    java.lang.reflect.Field capField =
+        StringHashTableDictionaryV2.class.getDeclaredField("capacity");
+    capField.setAccessible(true);
+
+    final int MAXIMUM_CAPACITY = 1 << 30;
+    for (float lf : new float[]{ 0.5f, 0.75f, 0.99f, 1.0f, 1.5f }) {
+      StringHashTableDictionaryV2 dict = new StringHashTableDictionaryV2(4, lf);
+      for (int i = 0; i < 200; i++) {
+        byte[] key = ("inv-lf" + lf + "-" + i).getBytes(StandardCharsets.UTF_8);
+        dict.add(key, 0, key.length);
+        int thresh = threshField.getInt(dict);
+        int cap    = capField.getInt(dict);
+        // When MAXIMUM_CAPACITY is reached, threshold = Integer.MAX_VALUE (sentinel).
+        // Otherwise threshold must be strictly < capacity.
+        if (cap < MAXIMUM_CAPACITY) {
+          assertTrue(thresh < cap,
+              "threshold=" + thresh + " must be < capacity=" + cap
+                  + " (loadFactor=" + lf + ", i=" + i + ")");
+        }
+      }
+    }
+  }
+
+  /**
+   * Verifies that a load factor &gt; 1.0 is handled safely end-to-end.
+   * The {@code n-1} cap in {@code maxFill()} ensures {@code threshold < capacity}
+   * even when {@code loadFactor &ge; 1.0}, preventing infinite probe loops.
+   */
+  @Test
+  public void testLoadFactorGreaterThanOneIsSafe() throws Exception {
+    // capacity=4, lf=2.0: threshold = min(ceil(8.0), 3) = 3
+    StringHashTableDictionaryV2 dict = new StringHashTableDictionaryV2(4, 2.0f);
+
+    final int COUNT = 200;
+    Map<String, Integer> keyToIndex = new HashMap<>();
+    for (int i = 0; i < COUNT; i++) {
+      String key = "extreme-lf-" + i;
+      byte[] b = key.getBytes(StandardCharsets.UTF_8);
+      int idx = dict.add(b, 0, b.length);
+      assertTrue(idx >= 0, "add() must return a non-negative index");
+      keyToIndex.put(key, idx);
+    }
+
+    assertEquals(COUNT, dict.size(), "size() must equal COUNT");
+    assertEquals(COUNT, new HashSet<>(keyToIndex.values()).size(),
+        "all keys must receive unique indices");
+
+    // Every key must be retrievable at its stored index
+    Text text = new Text();
+    for (Map.Entry<String, Integer> entry : keyToIndex.entrySet()) {
+      dict.getText(text, entry.getValue());
+      assertEquals(entry.getKey(), text.toString(),
+          "getText at index " + entry.getValue() + " must match");
+    }
+
+    // Duplicate detection must still work
+    for (int i = 0; i < COUNT; i++) {
+      String key = "extreme-lf-" + i;
+      byte[] b = key.getBytes(StandardCharsets.UTF_8);
+      assertEquals(keyToIndex.get(key).intValue(), dict.add(b, 0, b.length),
+          "duplicate add must return original index for " + key);
+    }
+  }
+
+  /**
+   * Tests {@code tableSizeFor()} for small, zero, and negative inputs that
+   * exercise the early-return {@code n &le; 1} branch.
+   */
+  @Test
+  public void testTableSizeForSmallAndNegativeValues() throws Exception {
+    java.lang.reflect.Method tsf =
+        StringHashTableDictionaryV2.class.getDeclaredMethod("tableSizeFor", int.class);
+    tsf.setAccessible(true);
+
+    int[][] cases = {
+        { Integer.MIN_VALUE, 1 },  // treated as <= 1
+        { -100, 1 },
+        { -1,   1 },
+        { 0,    1 },
+        { 1,    1 },
+        { 2,    2 },
+        { 3,    4 },
+        { 4,    4 },
+        { 5,    8 },
+        { 7,    8 },
+        { 8,    8 },
+        { 9,   16 },
+        { (1 << 29),      1 << 29 },  // exact power of two
+        { (1 << 29) + 1,  1 << 30 },  // next power of two = MAXIMUM_CAPACITY
+    };
+
+    for (int[] c : cases) {
+      int result = (int) tsf.invoke(null, c[0]);
+      assertEquals(c[1], result, "tableSizeFor(" + c[0] + ")");
+    }
+  }
+
+  /**
+   * Verifies that a negative {@code initialCapacity} is silently treated as
+   * &le; 1, producing a capacity-1 dictionary that grows on demand.
+   */
+  @Test
+  public void testNegativeInitialCapacity() throws Exception {
+    java.lang.reflect.Field capField =
+        StringHashTableDictionaryV2.class.getDeclaredField("capacity");
+    capField.setAccessible(true);
+
+    for (int bad : new int[]{ -1, -100, Integer.MIN_VALUE }) {
+      StringHashTableDictionaryV2 dict = new StringHashTableDictionaryV2(bad);
+      assertEquals(1, capField.getInt(dict),
+          "capacity should be 1 for initialCapacity=" + bad);
+
+      // The dictionary must still be fully usable
+      byte[] hello = "hello".getBytes(StandardCharsets.UTF_8);
+      byte[] world = "world".getBytes(StandardCharsets.UTF_8);
+      int idx0 = dict.add(hello, 0, hello.length);
+      int idx1 = dict.add(world, 0, world.length);
+      assertEquals(0, idx0);
+      assertEquals(1, idx1);
+      assertEquals(0, dict.add(hello, 0, hello.length), "duplicate must return idx0");
+      assertEquals(2, dict.size());
+
+      Text text = new Text();
+      dict.getText(text, idx0);
+      assertEquals("hello", text.toString());
+      dict.getText(text, idx1);
+      assertEquals("world", text.toString());
+    }
+  }
+
+  /**
+   * Verifies that {@code visit()} traverses exactly {@code size()} unique entries
+   * with no duplicates, and that {@code getOriginalPosition()} covers the
+   * contiguous range {@code [0, size - 1]}.
+   */
+  @Test
+  public void testVisitCountMatchesSize() throws Exception {
+    StringHashTableDictionaryV2 dict = new StringHashTableDictionaryV2(8);
+
+    final int N = 100;
+    for (int i = 0; i < N; i++) {
+      byte[] key = ("visit-key-" + i).getBytes(StandardCharsets.UTF_8);
+      dict.add(key, 0, key.length);
+    }
+    assertEquals(N, dict.size());
+
+    Set<Integer> positions = new HashSet<>();
+    dict.visit(ctx -> positions.add(ctx.getOriginalPosition()));
+
+    assertEquals(N, positions.size(),
+        "visit() must traverse exactly size() unique entries");
+    assertEquals(0, Collections.min(positions),
+        "smallest position must be 0");
+    assertEquals(N - 1, Collections.max(positions),
+        "largest position must be size - 1");
+  }
+
+  /**
+   * Verifies that {@code fnvHash()} never returns the {@code EMPTY} sentinel
+   * (0), even for inputs whose FNV-1a computation would naturally yield 0.
+   * The implementation replaces 0 with 1 to keep the sentinel unambiguous.
+   */
+  @Test
+  public void testFnvHashNeverReturnsZero() throws Exception {
+    java.lang.reflect.Method fnvHash =
+        StringHashTableDictionaryV2.class.getDeclaredMethod(
+            "fnvHash", byte[].class, int.class, int.class);
+    fnvHash.setAccessible(true);
+
+    // Empty string: FNV-1a offset basis (0x811c9dc5) is non-zero
+    byte[] empty = new byte[0];
+    int h = (int) fnvHash.invoke(null, empty, 0, 0);
+    assertTrue(h != 0, "fnvHash of empty string must not be 0");
+
+    // All 256 possible single-byte inputs
+    for (int b = 0; b < 256; b++) {
+      byte[] oneByte = new byte[]{ (byte) b };
+      int hash = (int) fnvHash.invoke(null, oneByte, 0, 1);
+      assertTrue(hash != 0,
+          "fnvHash must not return 0 for single-byte input 0x" + Integer.toHexString(b));
+    }
+
+    // All 256 complement pairs that maximally stress XOR cancellation
+    for (int b = 0; b < 256; b++) {
+      byte[] pair = new byte[]{ (byte) b, (byte) (b ^ 0xFF) };
+      int hash = (int) fnvHash.invoke(null, pair, 0, 2);
+      assertTrue(hash != 0,
+          "fnvHash must not return 0 for pair [" + b + ", " + (b ^ 0xFF) + "]");
+    }
+  }
+
+  /**
+   * Tests that multi-byte UTF-8 strings (Chinese, Japanese, Korean, emoji,
+   * and mixed ASCII/multi-byte) are stored and retrieved correctly.
+   */
+  @Test
+  public void testMultiByteUtf8Keys() throws Exception {
+    StringHashTableDictionaryV2 dict = new StringHashTableDictionaryV2(8);
+
+    String[] keys = {
+        "你好世界",           // Chinese:  4 chars, 12 UTF-8 bytes
+        "日本語",             // Japanese: 3 chars,  9 UTF-8 bytes
+        "한국어",             // Korean:   3 chars,  9 UTF-8 bytes
+        "\uD83D\uDE00",      // U+1F600 emoji: 4-byte UTF-8 sequence
+        "mix-混合-abc",       // mixed ASCII + CJK
+        "",                  // empty string (boundary)
+        "ASCII only",        // pure ASCII (regression guard)
+    };
+
+    int[] indices = new int[keys.length];
+    for (int i = 0; i < keys.length; i++) {
+      byte[] b = keys[i].getBytes(StandardCharsets.UTF_8);
+      indices[i] = dict.add(b, 0, b.length);
+    }
+    assertEquals(keys.length, dict.size(), "all keys are distinct");
+
+    // Duplicate detection
+    for (int i = 0; i < keys.length; i++) {
+      byte[] b = keys[i].getBytes(StandardCharsets.UTF_8);
+      assertEquals(indices[i], dict.add(b, 0, b.length),
+          "duplicate '" + keys[i] + "' must return same index");
+    }
+
+    // Retrieval via getText(Text, int)
+    Text text = new Text();
+    for (int i = 0; i < keys.length; i++) {
+      dict.getText(text, indices[i]);
+      assertEquals(keys[i], text.toString(),
+          "getText(Text, " + indices[i] + ") mismatch for '" + keys[i] + "'");
+    }
+
+    // Retrieval via getText(int) returning ByteBuffer
+    for (int i = 0; i < keys.length; i++) {
+      ByteBuffer buf = dict.getText(indices[i]);
+      String retrieved = StandardCharsets.UTF_8.decode(buf).toString();
+      assertEquals(keys[i], retrieved,
+          "getText(ByteBuffer, " + indices[i] + ") mismatch for '" + keys[i] + "'");
+    }
+  }
+
+  /**
+   * After {@code resize()} has expanded the table, {@code clear()} must
+   * preserve the expanded capacity and threshold.  Re-insertion must not
+   * trigger another resize until the expanded threshold is reached.
+   */
+  @Test
+  public void testClearPreservesExpandedThreshold() throws Exception {
+    java.lang.reflect.Field capField =
+        StringHashTableDictionaryV2.class.getDeclaredField("capacity");
+    capField.setAccessible(true);
+    java.lang.reflect.Field threshField =
+        StringHashTableDictionaryV2.class.getDeclaredField("threshold");
+    threshField.setAccessible(true);
+
+    StringHashTableDictionaryV2 dict = new StringHashTableDictionaryV2(2);
+
+    // Insert enough keys to trigger several resizes
+    for (int i = 0; i < 50; i++) {
+      byte[] key = ("pre-clear-" + i).getBytes(StandardCharsets.UTF_8);
+      dict.add(key, 0, key.length);
+    }
+    int expandedCapacity  = capField.getInt(dict);
+    int expandedThreshold = threshField.getInt(dict);
+    assertTrue(expandedCapacity > 2, "at least one resize must have occurred");
+
+    dict.clear();
+    assertEquals(0, dict.size(), "size must be 0 after clear()");
+
+    // clear() must not reset capacity or threshold
+    assertEquals(expandedCapacity, capField.getInt(dict),
+        "capacity must be preserved after clear()");
+    assertEquals(expandedThreshold, threshField.getInt(dict),
+        "threshold must be preserved after clear()");
+
+    // Re-insertion below the expanded threshold must NOT trigger any resize
+    for (int i = 0; i < expandedThreshold - 1; i++) {
+      byte[] key = ("post-clear-" + i).getBytes(StandardCharsets.UTF_8);
+      dict.add(key, 0, key.length);
+      assertEquals(expandedCapacity, capField.getInt(dict),
+          "no resize expected for i=" + i + " (< threshold=" + expandedThreshold + ")");
+    }
+  }
+
+  /**
+   * Stress test: inserts 10,000 unique keys, triggering many resizes, then
+   * verifies that all keys are accessible at their original positions and that
+   * duplicate detection returns stable indices throughout.
+   */
+  @Test
+  public void testStressTestManyUniqueKeys() throws Exception {
+    final int N = 10_000;
+    StringHashTableDictionaryV2 dict = new StringHashTableDictionaryV2(16);
+
+    Map<String, Integer> keyToIndex = new HashMap<>();
+    for (int i = 0; i < N; i++) {
+      String key = "stress-" + i;
+      byte[] b = key.getBytes(StandardCharsets.UTF_8);
+      int idx = dict.add(b, 0, b.length);
+      keyToIndex.put(key, idx);
+    }
+
+    assertEquals(N, dict.size(), "size() must equal N after N unique inserts");
+    assertEquals(N, new HashSet<>(keyToIndex.values()).size(),
+        "every key must receive a unique index");
+
+    // Every key is retrievable at its stored index
+    Text text = new Text();
+    for (Map.Entry<String, Integer> entry : keyToIndex.entrySet()) {
+      dict.getText(text, entry.getValue());
+      assertEquals(entry.getKey(), text.toString(),
+          "getText at index " + entry.getValue() + " must match original key");
+    }
+
+    // Duplicate pass: every re-add must return the same index as before
+    for (int i = 0; i < N; i++) {
+      String key = "stress-" + i;
+      byte[] b = key.getBytes(StandardCharsets.UTF_8);
+      assertEquals(keyToIndex.get(key).intValue(), dict.add(b, 0, b.length),
+          "duplicate add must return original index for " + key);
+    }
+
+    // visit() must cover exactly N unique positions in [0, N-1]
+    Set<Integer> visited = new HashSet<>();
+    dict.visit(ctx -> visited.add(ctx.getOriginalPosition()));
+    assertEquals(N, visited.size(), "visit() must cover all N keys");
+    assertEquals(0,     Collections.min(visited));
+    assertEquals(N - 1, Collections.max(visited));
   }
 }

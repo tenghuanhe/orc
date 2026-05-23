@@ -128,7 +128,7 @@ public class StringHashTableDictionaryV2 implements Dictionary {
     this.keyLengths = new DynamicIntArray(Math.max(1, initialCapacity));
     this.hashTable = new int[this.capacity];
     this.slotHashes = new int[this.capacity];
-    this.threshold = (int) ((double) this.capacity * loadFactor);
+    this.threshold = maxFill(this.capacity, loadFactor);
   }
 
   // -------------------------------------------------------------------------
@@ -298,6 +298,28 @@ public class StringHashTableDictionaryV2 implements Dictionary {
   }
 
   /**
+   * Returns the maximum number of entries that can be stored before the next
+   * resize, mirroring {@code it.unimi.dsi.fastutil.HashCommon#maxFill}.
+   *
+   * <p>Uses {@link Math#ceil} (not truncation) to avoid precision loss when
+   * converting the {@code float} load factor to {@code double}.
+   *
+   * <p>The {@code n - 1} cap is the <strong>critical safety property</strong>:
+   * linear probing requires at least one permanently empty slot so that the
+   * probe loop in {@link #add} terminates even for keys not present in the
+   * table.  Without this cap, a caller passing {@code loadFactor &ge; 1.0}
+   * could fill every slot, causing an infinite loop on the next lookup of a
+   * missing key.
+   *
+   * @param n the current table capacity (power of two).
+   * @param f the load factor.
+   * @return the maximum fill count before resize ({@code <= n - 1}).
+   */
+  private static int maxFill(final int n, final float f) {
+    return Math.min((int) Math.ceil(n * (double) f), n - 1);
+  }
+
+  /**
    * Doubles the table capacity and rehashes all existing entries.
    *
    * <p>If {@code capacity} has already reached {@link #MAXIMUM_CAPACITY} ({@code 1 << 30}),
@@ -339,8 +361,8 @@ public class StringHashTableDictionaryV2 implements Dictionary {
     this.mask = newCapacity - 1;
     this.hashTable = newHashTable;
     this.slotHashes = newSlotHashes;
-    // newCapacity <= MAXIMUM_CAPACITY = 1<<30, so newCapacity * loadFactor fits in int.
-    this.threshold = (int) ((double) newCapacity * loadFactor);
+    // newCapacity <= MAXIMUM_CAPACITY = 1<<30, so maxFill always fits in int.
+    this.threshold = maxFill(newCapacity, loadFactor);
 
     for (int i = 0; i < oldCapacity; i++) {
       if (oldHashTable[i] == EMPTY) {
