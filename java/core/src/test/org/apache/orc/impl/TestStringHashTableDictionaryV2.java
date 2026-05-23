@@ -534,9 +534,10 @@ public class TestStringHashTableDictionaryV2 {
           "tableSizeFor(" + n + ") should be capped at MAXIMUM_CAPACITY");
     }
 
-    // Power-of-two inputs up to MAXIMUM_CAPACITY must be returned as-is.
-    assertEquals(maximumCapacity, (int) m.invoke(null, maximumCapacity));
-    assertEquals(1 << 29,         (int) m.invoke(null, (1 << 29) + 1));
+    // A non-power-of-two just above 2^29 must be rounded up to 2^30.
+    assertEquals(maximumCapacity, (int) m.invoke(null, (1 << 29) + 1));
+    // An exact power-of-two (2^29) must be returned unchanged.
+    assertEquals(1 << 29,         (int) m.invoke(null, 1 << 29));
   }
 
   /**
@@ -545,43 +546,39 @@ public class TestStringHashTableDictionaryV2 {
    * Instead {@code threshold} is pinned to {@link Integer#MAX_VALUE} so that
    * no further resize is attempted.
    *
-   * <p>Uses reflection to set {@code capacity} and {@code threshold} to the
-   * boundary values without allocating a multi-gigabyte backing array.
+   * <p>Uses reflection to inject {@code capacity = MAXIMUM_CAPACITY} and then
+   * calls {@code resize()} directly, avoiding any allocation of a multi-gigabyte
+   * backing array and avoiding the {@link ArrayIndexOutOfBoundsException} that
+   * would occur if {@code add()} were called with a forged mask on a small table.
    */
   @Test
   public void testResizeDoesNotOverflowAtMaximumCapacity() throws Exception {
     final int maximumCapacity = 1 << 30;
 
-    // Start with a modest table; we'll forge the capacity field via reflection.
     StringHashTableDictionaryV2 dict = new StringHashTableDictionaryV2(4, 1.0f);
 
-    // Inject capacity = MAXIMUM_CAPACITY, mask, and threshold = 0 so that the
-    // very next add() call will invoke resize() with capacity == MAXIMUM_CAPACITY.
+    // Forge capacity = MAXIMUM_CAPACITY so that resize() observes the boundary.
     java.lang.reflect.Field capField =
         StringHashTableDictionaryV2.class.getDeclaredField("capacity");
     capField.setAccessible(true);
     capField.setInt(dict, maximumCapacity);
 
-    java.lang.reflect.Field maskField =
-        StringHashTableDictionaryV2.class.getDeclaredField("mask");
-    maskField.setAccessible(true);
-    maskField.setInt(dict, maximumCapacity - 1);
+    // Call resize() directly via reflection; it must recognise that
+    // capacity == MAXIMUM_CAPACITY and return immediately after pinning
+    // threshold, rather than executing `oldCapacity << 1` which would produce
+    // a negative value and cause NegativeArraySizeException.
+    java.lang.reflect.Method resizeMethod =
+        StringHashTableDictionaryV2.class.getDeclaredMethod("resize");
+    resizeMethod.setAccessible(true);
+    resizeMethod.invoke(dict); // must not throw
 
+    // threshold must have been pinned to Integer.MAX_VALUE.
     java.lang.reflect.Field thrField =
         StringHashTableDictionaryV2.class.getDeclaredField("threshold");
     thrField.setAccessible(true);
-    thrField.setInt(dict, 0); // force resize() on the very next add
-
-    // add() must not throw NegativeArraySizeException or any other error.
-    dict.add(new Text("boundary-key"));
-
-    // threshold must have been pinned to Integer.MAX_VALUE.
     assertEquals(Integer.MAX_VALUE, thrField.getInt(dict));
 
-    // The key must still be retrievable.
-    assertEquals(1, dict.size());
-    Text result = new Text();
-    dict.getText(result, 0);
-    assertEquals("boundary-key", result.toString());
+    // capacity must remain at MAXIMUM_CAPACITY (not doubled or otherwise changed).
+    assertEquals(maximumCapacity, capField.getInt(dict));
   }
 }
