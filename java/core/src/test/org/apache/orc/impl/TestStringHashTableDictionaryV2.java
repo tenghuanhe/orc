@@ -509,7 +509,7 @@ public class TestStringHashTableDictionaryV2 {
   }
 
   // -------------------------------------------------------------------------
-  // Resize overflow boundary (MAXIMUM_CAPACITY guard)
+  // Resize overflow boundary
   // -------------------------------------------------------------------------
 
   /**
@@ -542,17 +542,17 @@ public class TestStringHashTableDictionaryV2 {
   }
 
   /**
-   * Verifies that {@code resize()} throws {@link OutOfMemoryError} when the
-   * capacity has already reached {@code MAXIMUM_CAPACITY} (1 &lt;&lt; 30).
-   * Doubling such a capacity would overflow a signed 32-bit integer and produce
-   * a negative array size; fail-fast with an unrecoverable error is safer than
-   * silently degrading (which risks an infinite loop once every slot is occupied).
+   * Verifies that {@code resize()} throws {@link NegativeArraySizeException} when
+   * {@code capacity} is already {@code 1 << 30}.  The left-shift
+   * {@code oldCapacity << 1} then produces {@link Integer#MIN_VALUE} (negative),
+   * and {@code new int[negativeValue]} throws immediately — preventing any
+   * possibility of an infinite loop in {@link StringHashTableDictionaryV2#add}.
    *
    * <p>Uses reflection to inject {@code capacity = MAXIMUM_CAPACITY} and call
    * {@code resize()} directly, avoiding any real multi-gigabyte allocation.
    */
   @Test
-  public void testResizeThrowsOutOfMemoryErrorAtMaximumCapacity() throws Exception {
+  public void testResizeThrowsNegativeArraySizeAtMaximumCapacity() throws Exception {
     final int maximumCapacity = 1 << 30;
 
     StringHashTableDictionaryV2 dict = new StringHashTableDictionaryV2(4, 1.0f);
@@ -567,13 +567,13 @@ public class TestStringHashTableDictionaryV2 {
         StringHashTableDictionaryV2.class.getDeclaredMethod("resize");
     resizeMethod.setAccessible(true);
 
-    // resize() must throw OutOfMemoryError (wrapped by reflection as InvocationTargetException).
+    // resize() must throw NegativeArraySizeException (wrapped by reflection).
     try {
       resizeMethod.invoke(dict);
-      fail("Expected OutOfMemoryError when capacity == MAXIMUM_CAPACITY");
+      fail("Expected NegativeArraySizeException when capacity == MAXIMUM_CAPACITY");
     } catch (java.lang.reflect.InvocationTargetException ite) {
-      assertTrue(ite.getCause() instanceof OutOfMemoryError,
-          "Expected OutOfMemoryError cause, got: " + ite.getCause());
+      assertTrue(ite.getCause() instanceof NegativeArraySizeException,
+          "Expected NegativeArraySizeException cause, got: " + ite.getCause());
     }
   }
 }

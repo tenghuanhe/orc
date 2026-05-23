@@ -304,6 +304,14 @@ public class StringHashTableDictionaryV2 implements Dictionary {
   /**
    * Doubles the table capacity and rehashes all existing entries.
    *
+   * <p>If {@code capacity} has already reached {@code 1 << 30}, the shift
+   * {@code oldCapacity << 1} produces a negative value and
+   * {@code new int[negativeSize]} immediately throws
+   * {@link NegativeArraySizeException} – an unrecoverable failure that
+   * prevents an infinite loop in {@link #add}.  Reaching this boundary
+   * requires inserting more than 750 million distinct keys, which exhausts
+   * tens of gigabytes of heap long before the table is full in practice.
+   *
    * <p>Note: {@link #getIndex} is <em>not</em> called during rehashing.
    * Each occupied slot is repositioned using its stored FNV-1a fingerprint
    * ({@code slotHashes[i] & newMask}) directly, without re-reading key bytes.
@@ -312,15 +320,6 @@ public class StringHashTableDictionaryV2 implements Dictionary {
    * affect slot placement after a resize.
    */
   private void resize() {
-    if (capacity >= MAXIMUM_CAPACITY) {
-      // Reaching this point requires > 750 million distinct keys in a single column,
-      // which demands tens of gigabytes of heap. Silently capping the threshold would
-      // risk an infinite loop in add() once every slot is occupied. Fail fast instead.
-      throw new OutOfMemoryError(
-          "StringHashTableDictionaryV2 capacity would exceed MAXIMUM_CAPACITY ("
-              + MAXIMUM_CAPACITY + ") on resize");
-    }
-
     final int oldCapacity = this.capacity;
     final int[] oldHashTable = this.hashTable;
     final int[] oldSlotHashes = this.slotHashes;
