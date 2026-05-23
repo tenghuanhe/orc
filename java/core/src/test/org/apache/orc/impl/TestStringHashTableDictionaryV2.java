@@ -22,11 +22,16 @@ import org.apache.hadoop.io.Text;
 import org.apache.orc.StringDictTestingUtils;
 import org.junit.jupiter.api.Test;
 
+import java.io.ByteArrayOutputStream;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Set;
 
+import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class TestStringHashTableDictionaryV2 {
 
@@ -177,5 +182,328 @@ public class TestStringHashTableDictionaryV2 {
 
     hashTableDictionary.clear();
     assertEquals(0, hashTableDictionary.size());
+  }
+
+  // -------------------------------------------------------------------------
+  // resize() coverage
+  // -------------------------------------------------------------------------
+
+  /**
+   * Verifies that {@code resize()} correctly rehashes all entries and every
+   * key remains accessible at its original position after two consecutive
+   * resizes.
+   *
+   * <p>With {@code initialCapacity=2}: capacity=2, threshold=1.
+   * <ul>
+   *   <li>add("apple")  – size=0 &lt; 1 → no resize; size→1</li>
+   *   <li>add("banana") – size=1 ≥ 1 → resize → capacity=4, threshold=3; size→2</li>
+   *   <li>add("cherry") – size=2 &lt; 3 → no resize; size→3</li>
+   *   <li>add("date")   – size=3 ≥ 3 → resize → capacity=8, threshold=6; size→4</li>
+   *   <li>add("fig")    – size=4 &lt; 6 → no resize; size→5</li>
+   * </ul>
+   */
+  @Test
+  public void testResizePreservesAllKeys() throws Exception {
+    StringHashTableDictionaryV2 dict = new StringHashTableDictionaryV2(2);
+
+    assertEquals(0, dict.add(new Text("apple")));
+    assertEquals(1, dict.add(new Text("banana")));
+    assertEquals(2, dict.add(new Text("cherry")));
+    assertEquals(3, dict.add(new Text("date")));
+    assertEquals(4, dict.add(new Text("fig")));
+    assertEquals(5, dict.size());
+
+    // All keys must be retrievable at their original positions after two resizes.
+    Text t = new Text();
+    dict.getText(t, 0); assertEquals("apple",  t.toString());
+    dict.getText(t, 1); assertEquals("banana", t.toString());
+    dict.getText(t, 2); assertEquals("cherry", t.toString());
+    dict.getText(t, 3); assertEquals("date",   t.toString());
+    dict.getText(t, 4); assertEquals("fig",    t.toString());
+
+    // Duplicate detection must still work correctly after resize.
+    assertEquals(0, dict.add(new Text("apple")));
+    assertEquals(1, dict.add(new Text("banana")));
+    assertEquals(2, dict.add(new Text("cherry")));
+    assertEquals(3, dict.add(new Text("date")));
+    assertEquals(4, dict.add(new Text("fig")));
+    assertEquals(5, dict.size()); // no growth
+  }
+
+  // -------------------------------------------------------------------------
+  // Linear probing and fingerprint fast-rejection coverage
+  // -------------------------------------------------------------------------
+
+  /**
+   * Extension that forces all keys to start probing at slot 0, creating a
+   * deterministic left-to-right collision chain.
+   *
+   * <p>Keep insertions below the resize threshold so that the overridden
+   * {@code getIndex} is never bypassed by
+   * {@link StringHashTableDictionaryV2#resize()}.
+   */
+  private static class AllSlotZeroDictionary extends StringHashTableDictionaryV2 {
+    AllSlotZeroDictionary(int initialCapacity) {
+      super(initialCapacity);
+    }
+
+    @Override
+    int getIndex(byte[] bytes, int offset, int length, int hash) {
+      return 0;
+    }
+  }
+
+  /**
+   * Verifies linear probing and FNV-1a fingerprint fast-rejection.
+   *
+   * <p>All insertions start at slot 0 ({@link AllSlotZeroDictionary}), creating
+   * the chain: "first"→slot 0, "second"→slot 1, "third"→slot 2.
+   *
+   * <p>Duplicate lookups exercise the full probe chain:
+   * <ul>
+   *   <li>"first" duplicate – fingerprint match at slot 0 (direct hit)</li>
+   *   <li>"second" duplicate – fingerprint mismatch at slot 0 → probe → hit slot 1</li>
+   *   <li>"third" duplicate – fingerprint mismatches at slots 0,1 → probe → hit slot 2</li>
+   * </ul>
+   */
+  @Test
+  public void testLinearProbingAndFingerprintRejection() throws Exception {
+    // capacity=8, threshold=6; keep size ≤ 5 to stay below the threshold.
+    AllSlotZeroDictionary dict = new AllSlotZeroDictionary(8);
+
+    assertEquals(0, dict.add(new Text("first")));
+    assertEquals(1, dict.add(new Text("second")));
+    assertEquals(2, dict.add(new Text("third")));
+    assertEquals(3, dict.size());
+
+    // Duplicate detection through the full probe chain.
+    assertEquals(0, dict.add(new Text("first")));   // direct hit at slot 0
+    assertEquals(1, dict.add(new Text("second")));  // skip slot 0 (fingerprint mismatch), hit slot 1
+    assertEquals(2, dict.add(new Text("third")));   // skip slots 0,1, hit slot 2
+    assertEquals(3, dict.size());                   // no new entries
+
+    // Traversal order: slots 0→1→2 hold "first"(0), "second"(1), "third"(2).
+    StringDictTestingUtils.checkContents(dict, new int[]{0, 1, 2}, "first", "second", "third");
+  }
+
+  // -------------------------------------------------------------------------
+  // getText(int) / writeTo() coverage
+  // -------------------------------------------------------------------------
+
+  /**
+   * Tests the {@link StringHashTableDictionaryV2#getText(int)} overload that
+   * returns a {@link ByteBuffer}.
+   */
+  @Test
+  public void testGetTextByteBuffer() {
+    StringHashTableDictionaryV2 dict = new StringHashTableDictionaryV2(4);
+    dict.add(new Text("hello"));
+    dict.add(new Text("world"));
+
+    ByteBuffer buf0 = dict.getText(0);
+    byte[] bytes0 = new byte[buf0.remaining()];
+    buf0.get(bytes0);
+    assertEquals("hello", new String(bytes0, StandardCharsets.UTF_8));
+
+    ByteBuffer buf1 = dict.getText(1);
+    byte[] bytes1 = new byte[buf1.remaining()];
+    buf1.get(bytes1);
+    assertEquals("world", new String(bytes1, StandardCharsets.UTF_8));
+  }
+
+  /**
+   * Tests {@link StringHashTableDictionaryV2#writeTo(java.io.OutputStream, int)}.
+   */
+  @Test
+  public void testWriteTo() throws Exception {
+    StringHashTableDictionaryV2 dict = new StringHashTableDictionaryV2(4);
+    dict.add(new Text("hello"));
+    dict.add(new Text("world"));
+
+    ByteArrayOutputStream baos = new ByteArrayOutputStream();
+    int len0 = dict.writeTo(baos, 0);
+    assertEquals("hello".length(), len0);
+    assertArrayEquals("hello".getBytes(StandardCharsets.UTF_8), baos.toByteArray());
+
+    baos.reset();
+    int len1 = dict.writeTo(baos, 1);
+    assertEquals("world".length(), len1);
+    assertArrayEquals("world".getBytes(StandardCharsets.UTF_8), baos.toByteArray());
+  }
+
+  // -------------------------------------------------------------------------
+  // Edge cases: empty string, byte offset, small capacity, load factor
+  // -------------------------------------------------------------------------
+
+  /**
+   * Verifies that an empty (zero-length) key is stored, retrieved, and
+   * de-duplicated correctly.
+   */
+  @Test
+  public void testEmptyString() throws Exception {
+    StringHashTableDictionaryV2 dict = new StringHashTableDictionaryV2(4);
+    byte[] empty = new byte[0];
+
+    assertEquals(0, dict.add(empty, 0, 0));
+    assertEquals(0, dict.add(empty, 0, 0)); // duplicate
+    assertEquals(1, dict.size());
+
+    Text t = new Text();
+    dict.getText(t, 0);
+    assertEquals("", t.toString());
+
+    ByteBuffer buf = dict.getText(0);
+    assertEquals(0, buf.remaining());
+  }
+
+  /**
+   * Verifies that {@code add(byte[], offset, length)} with a non-zero
+   * {@code offset} correctly identifies duplicates regardless of the buffer
+   * position the bytes reside in.
+   */
+  @Test
+  public void testAddBytesWithNonZeroOffset() throws Exception {
+    StringHashTableDictionaryV2 dict = new StringHashTableDictionaryV2(4);
+
+    byte[] buf1 = "XhelloX".getBytes(StandardCharsets.UTF_8);
+    byte[] buf2 = "YhelloY".getBytes(StandardCharsets.UTF_8);
+
+    assertEquals(0, dict.add(buf1, 1, 5)); // "hello" from offset 1
+    assertEquals(0, dict.add(buf2, 1, 5)); // same content → duplicate
+    assertEquals(1, dict.size());
+
+    Text t = new Text();
+    dict.getText(t, 0);
+    assertEquals("hello", t.toString());
+  }
+
+  /**
+   * Verifies that {@code initialCapacity} values of 0 and 1 both produce a
+   * starting table capacity of 1 (via {@code tableSizeFor}), and that the
+   * table grows on-demand as keys are inserted.
+   */
+  @Test
+  public void testSmallInitialCapacity() throws Exception {
+    for (int initCap : new int[]{0, 1}) {
+      StringHashTableDictionaryV2 dict = new StringHashTableDictionaryV2(initCap);
+      // capacity=1; hashTable[1] + slotHashes[1] = 2*1*4 = 8 bytes
+      assertEquals(2L * 1 * Integer.BYTES, dict.getSizeInBytes());
+
+      // threshold=0, so every add triggers resize until stable
+      assertEquals(0, dict.add(new Text("x")));
+      assertEquals(1, dict.add(new Text("y")));
+      assertEquals(2, dict.add(new Text("z")));
+      assertEquals(3, dict.size());
+
+      Text t = new Text();
+      dict.getText(t, 0); assertEquals("x", t.toString());
+      dict.getText(t, 1); assertEquals("y", t.toString());
+      dict.getText(t, 2); assertEquals("z", t.toString());
+
+      // Duplicate detection must work after multiple resizes.
+      assertEquals(0, dict.add(new Text("x")));
+      assertEquals(1, dict.add(new Text("y")));
+      assertEquals(2, dict.add(new Text("z")));
+      assertEquals(3, dict.size());
+    }
+  }
+
+  /**
+   * Verifies that a custom load factor controls when resize is triggered.
+   *
+   * <p>With {@code initialCapacity=4} and {@code loadFactor=0.5}:
+   * capacity=4, threshold=2. The third insertion triggers resize.
+   */
+  @Test
+  public void testCustomLoadFactor() throws Exception {
+    StringHashTableDictionaryV2 dict = new StringHashTableDictionaryV2(4, 0.5f);
+    // threshold = (int)(4 * 0.5) = 2
+
+    assertEquals(0, dict.add(new Text("alpha")));
+    assertEquals(1, dict.add(new Text("beta")));
+    // size=2 ≥ threshold=2 → resize triggered on next add
+    assertEquals(2, dict.add(new Text("gamma")));
+    assertEquals(3, dict.size());
+
+    Text t = new Text();
+    dict.getText(t, 0); assertEquals("alpha", t.toString());
+    dict.getText(t, 1); assertEquals("beta",  t.toString());
+    dict.getText(t, 2); assertEquals("gamma", t.toString());
+
+    // Duplicate detection works after resize.
+    assertEquals(0, dict.add(new Text("alpha")));
+    assertEquals(1, dict.add(new Text("beta")));
+    assertEquals(2, dict.add(new Text("gamma")));
+    assertEquals(3, dict.size());
+  }
+
+  // -------------------------------------------------------------------------
+  // clear() + reuse coverage
+  // -------------------------------------------------------------------------
+
+  /**
+   * Verifies that {@link StringHashTableDictionaryV2#clear()} resets the
+   * logical state (size, key data) without shrinking the hash-table arrays,
+   * and that subsequent insertions build a fresh dictionary from position 0.
+   *
+   * <p>Also confirms that keys present before {@code clear()} are no longer
+   * found after it, and are re-inserted as new entries if added again.
+   */
+  @Test
+  public void testClearAndReuseAfterResize() throws Exception {
+    StringHashTableDictionaryV2 dict = new StringHashTableDictionaryV2(2);
+
+    // Trigger at least one resize so the post-clear capacity is larger than initial.
+    assertEquals(0, dict.add(new Text("one")));
+    assertEquals(1, dict.add(new Text("two")));
+    assertEquals(2, dict.add(new Text("three")));
+    assertEquals(3, dict.size());
+
+    dict.clear();
+    assertEquals(0, dict.size());
+    // Hash-table arrays are kept (capacity stays doubled); dynamic key arrays
+    // are freed, so only the flat int[] contribute to the in-memory footprint.
+    assertTrue(dict.getSizeInBytes() > 0);
+
+    // Re-add different items; positions restart from 0.
+    assertEquals(0, dict.add(new Text("alpha")));
+    assertEquals(1, dict.add(new Text("beta")));
+    assertEquals(2, dict.add(new Text("gamma")));
+    assertEquals(3, dict.size());
+
+    Text t = new Text();
+    dict.getText(t, 0); assertEquals("alpha", t.toString());
+    dict.getText(t, 1); assertEquals("beta",  t.toString());
+    dict.getText(t, 2); assertEquals("gamma", t.toString());
+
+    // The pre-clear strings are gone; re-adding them yields new positions.
+    assertEquals(3, dict.add(new Text("one")));
+    assertEquals(4, dict.add(new Text("two")));
+    assertEquals(5, dict.add(new Text("three")));
+    assertEquals(6, dict.size());
+  }
+
+  // -------------------------------------------------------------------------
+  // getSizeInBytes() growth coverage
+  // -------------------------------------------------------------------------
+
+  /**
+   * Verifies that {@link StringHashTableDictionaryV2#getSizeInBytes()} grows
+   * after keys are inserted, reflecting the allocation of dynamic byte and
+   * int arrays for key storage.
+   */
+  @Test
+  public void testSizeInBytesGrowsAfterAdd() {
+    StringHashTableDictionaryV2 dict = new StringHashTableDictionaryV2(8);
+    long initialSize = dict.getSizeInBytes();
+    // capacity=8; only hashTable + slotHashes contribute initially.
+    assertEquals(2L * 8 * Integer.BYTES, initialSize);
+
+    dict.add(new Text("hello"));
+    dict.add(new Text("world"));
+
+    // After insertions, byteArray, keyOffsets, and keyLengths have allocated
+    // chunks, so the total must exceed the initial hash-table-only footprint.
+    assertTrue(dict.getSizeInBytes() > initialSize);
   }
 }

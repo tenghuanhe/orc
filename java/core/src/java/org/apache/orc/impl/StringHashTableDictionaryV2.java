@@ -121,8 +121,8 @@ public class StringHashTableDictionaryV2 implements Dictionary {
     this.loadFactor = loadFactor;
     this.capacity = tableSizeFor(initialCapacity);
     this.mask = this.capacity - 1;
-    this.keyOffsets = new DynamicIntArray(initialCapacity);
-    this.keyLengths = new DynamicIntArray(initialCapacity);
+    this.keyOffsets = new DynamicIntArray(Math.max(1, initialCapacity));
+    this.keyLengths = new DynamicIntArray(Math.max(1, initialCapacity));
     this.hashTable = new int[this.capacity];
     this.slotHashes = new int[this.capacity];
     this.threshold = (int) Math.min((double) this.capacity * loadFactor, MAX_ARRAY_SIZE + 1L);

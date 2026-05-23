@@ -24,16 +24,7 @@ import org.apache.orc.OrcConf;
 import org.apache.orc.OrcProto;
 import org.apache.orc.StringColumnStatistics;
 import org.apache.orc.TypeDescription;
-import org.apache.orc.impl.CryptoUtils;
-import org.apache.orc.impl.Dictionary;
-import org.apache.orc.impl.DynamicIntArray;
-import org.apache.orc.impl.IntegerWriter;
-import org.apache.orc.impl.OutStream;
-import org.apache.orc.impl.PositionRecorder;
-import org.apache.orc.impl.PositionedOutputStream;
-import org.apache.orc.impl.StreamName;
-import org.apache.orc.impl.StringHashTableDictionary;
-import org.apache.orc.impl.StringRedBlackTree;
+import org.apache.orc.impl.*;
 
 import java.io.IOException;
 import java.util.ArrayList;
