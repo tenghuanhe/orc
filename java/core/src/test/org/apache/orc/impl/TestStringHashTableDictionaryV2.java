@@ -572,8 +572,8 @@ public class TestStringHashTableDictionaryV2 {
       resizeMethod.invoke(dict);
       fail("Expected OutOfMemoryError when capacity == MAXIMUM_CAPACITY");
     } catch (java.lang.reflect.InvocationTargetException ite) {
-      assertTrue("Expected OutOfMemoryError cause, got: " + ite.getCause(),
-          ite.getCause() instanceof OutOfMemoryError);
+      assertTrue(ite.getCause() instanceof OutOfMemoryError,
+          "Expected OutOfMemoryError cause, got: " + ite.getCause());
     }
   }
 }
