@@ -67,10 +67,6 @@ public class StringHashTableDictionaryV2 implements Dictionary {
    */
   private static final int MAXIMUM_CAPACITY = 1 << 30;
 
-  /**
-   * The maximum table size to allocate, matching {@link java.util.Hashtable}.
-   */
-  private static final int MAX_ARRAY_SIZE = Integer.MAX_VALUE - 8;
 
   // --- Key storage (never reorganised; only appended) ---
 
@@ -132,7 +128,7 @@ public class StringHashTableDictionaryV2 implements Dictionary {
     this.keyLengths = new DynamicIntArray(Math.max(1, initialCapacity));
     this.hashTable = new int[this.capacity];
     this.slotHashes = new int[this.capacity];
-    this.threshold = (int) Math.min((double) this.capacity * loadFactor, MAX_ARRAY_SIZE + 1L);
+    this.threshold = (int) ((double) this.capacity * loadFactor);
   }
 
   // -------------------------------------------------------------------------
@@ -304,13 +300,14 @@ public class StringHashTableDictionaryV2 implements Dictionary {
   /**
    * Doubles the table capacity and rehashes all existing entries.
    *
-   * <p>If {@code capacity} has already reached {@code 1 << 30}, the shift
-   * {@code oldCapacity << 1} produces a negative value and
-   * {@code new int[negativeSize]} immediately throws
-   * {@link NegativeArraySizeException} – an unrecoverable failure that
-   * prevents an infinite loop in {@link #add}.  Reaching this boundary
-   * requires inserting more than 750 million distinct keys, which exhausts
-   * tens of gigabytes of heap long before the table is full in practice.
+   * <p>If {@code capacity} has already reached {@link #MAXIMUM_CAPACITY} ({@code 1 << 30}),
+   * no further resize is performed; the threshold is instead raised to
+   * {@link Integer#MAX_VALUE} so that {@link #add} never triggers another
+   * resize attempt.  This mirrors the behaviour of {@code java.util.HashMap}.
+   * In Java, {@code (1 << 30) << 1} silently wraps to {@code Integer.MIN_VALUE}
+   * (JLS §15.19: shift amount is taken mod 32 for {@code int}), and
+   * {@code new int[Integer.MIN_VALUE]} would immediately throw
+   * {@link NegativeArraySizeException}, so the guard is required.
    *
    * <p>Note: {@link #getIndex} is <em>not</em> called during rehashing.
    * Each occupied slot is repositioned using its stored FNV-1a fingerprint
@@ -321,10 +318,18 @@ public class StringHashTableDictionaryV2 implements Dictionary {
    */
   private void resize() {
     final int oldCapacity = this.capacity;
+
+    // At MAXIMUM_CAPACITY we cannot double the array without overflowing a
+    // signed 32-bit int.  Raise the threshold to inhibit future resize calls.
+    if (oldCapacity >= MAXIMUM_CAPACITY) {
+      this.threshold = Integer.MAX_VALUE;
+      return;
+    }
+
     final int[] oldHashTable = this.hashTable;
     final int[] oldSlotHashes = this.slotHashes;
 
-    final int newCapacity = oldCapacity << 1;
+    final int newCapacity = oldCapacity << 1;  // always <= MAXIMUM_CAPACITY, safe
     final int[] newHashTable = new int[newCapacity];
     final int[] newSlotHashes = new int[newCapacity];
 
@@ -334,7 +339,8 @@ public class StringHashTableDictionaryV2 implements Dictionary {
     this.mask = newCapacity - 1;
     this.hashTable = newHashTable;
     this.slotHashes = newSlotHashes;
-    this.threshold = (int) Math.min((double) newCapacity * loadFactor, MAX_ARRAY_SIZE + 1L);
+    // newCapacity <= MAXIMUM_CAPACITY = 1<<30, so newCapacity * loadFactor fits in int.
+    this.threshold = (int) ((double) newCapacity * loadFactor);
 
     for (int i = 0; i < oldCapacity; i++) {
       if (oldHashTable[i] == EMPTY) {

@@ -542,17 +542,17 @@ public class TestStringHashTableDictionaryV2 {
   }
 
   /**
-   * Verifies that {@code resize()} throws {@link NegativeArraySizeException} when
-   * {@code capacity} is already {@code 1 << 30}.  The left-shift
-   * {@code oldCapacity << 1} then produces {@link Integer#MIN_VALUE} (negative),
-   * and {@code new int[negativeValue]} throws immediately — preventing any
-   * possibility of an infinite loop in {@link StringHashTableDictionaryV2#add}.
+   * Verifies that {@code resize()} handles the {@code MAXIMUM_CAPACITY} boundary
+   * gracefully: instead of attempting to allocate a negative-sized array
+   * (which would throw {@link NegativeArraySizeException}), it raises the
+   * threshold to {@link Integer#MAX_VALUE} to permanently suppress further
+   * resize attempts — mirroring {@code java.util.HashMap}'s behaviour.
    *
    * <p>Uses reflection to inject {@code capacity = MAXIMUM_CAPACITY} and call
    * {@code resize()} directly, avoiding any real multi-gigabyte allocation.
    */
   @Test
-  public void testResizeThrowsNegativeArraySizeAtMaximumCapacity() throws Exception {
+  public void testResizeAtMaximumCapacityRaisesThreshold() throws Exception {
     final int maximumCapacity = 1 << 30;
 
     StringHashTableDictionaryV2 dict = new StringHashTableDictionaryV2(4, 1.0f);
@@ -563,17 +563,22 @@ public class TestStringHashTableDictionaryV2 {
     capField.setAccessible(true);
     capField.setInt(dict, maximumCapacity);
 
+    java.lang.reflect.Field threshField =
+        StringHashTableDictionaryV2.class.getDeclaredField("threshold");
+    threshField.setAccessible(true);
+
     java.lang.reflect.Method resizeMethod =
         StringHashTableDictionaryV2.class.getDeclaredMethod("resize");
     resizeMethod.setAccessible(true);
 
-    // resize() must throw NegativeArraySizeException (wrapped by reflection).
-    try {
-      resizeMethod.invoke(dict);
-      fail("Expected NegativeArraySizeException when capacity == MAXIMUM_CAPACITY");
-    } catch (java.lang.reflect.InvocationTargetException ite) {
-      assertTrue(ite.getCause() instanceof NegativeArraySizeException,
-          "Expected NegativeArraySizeException cause, got: " + ite.getCause());
-    }
+    // resize() must NOT throw; it should set threshold = Integer.MAX_VALUE.
+    resizeMethod.invoke(dict);
+
+    assertEquals(Integer.MAX_VALUE, threshField.getInt(dict),
+        "resize() at MAXIMUM_CAPACITY must set threshold = Integer.MAX_VALUE");
+
+    // capacity must remain unchanged (no reallocation occurred).
+    assertEquals(maximumCapacity, capField.getInt(dict),
+        "capacity must remain MAXIMUM_CAPACITY after no-op resize");
   }
 }
