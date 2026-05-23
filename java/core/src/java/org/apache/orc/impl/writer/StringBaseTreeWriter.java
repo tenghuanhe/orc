@@ -63,16 +63,12 @@ public abstract class StringBaseTreeWriter extends TreeWriterBase {
   private static Dictionary createDict(Configuration conf) {
     String dictImpl = conf.get(DICTIONARY_IMPL.getAttribute(),
         DICTIONARY_IMPL.getDefaultValue().toString()).toUpperCase();
-    switch (Dictionary.IMPL.valueOf(dictImpl)) {
-      case RBTREE:
-        return new StringRedBlackTree(INITIAL_DICTIONARY_SIZE);
-      case HASH:
-        return new StringHashTableDictionary(INITIAL_DICTIONARY_SIZE);
-      case HASH_V2:
-        return new StringHashTableDictionaryV2(INITIAL_DICTIONARY_SIZE);
-      default:
-        throw new UnsupportedOperationException("Unknown implementation:" + dictImpl);
-    }
+    return switch (Dictionary.IMPL.valueOf(dictImpl)) {
+      case RBTREE -> new StringRedBlackTree(INITIAL_DICTIONARY_SIZE);
+      case HASH -> new StringHashTableDictionary(INITIAL_DICTIONARY_SIZE);
+      case HASH_V2 -> new StringHashTableDictionaryV2(INITIAL_DICTIONARY_SIZE);
+      default -> throw new UnsupportedOperationException("Unknown implementation:" + dictImpl);
+    };
   }
 
   StringBaseTreeWriter(TypeDescription schema,
