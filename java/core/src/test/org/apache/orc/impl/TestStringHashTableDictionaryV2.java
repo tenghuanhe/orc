@@ -32,6 +32,7 @@ import java.util.Set;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 
 public class TestStringHashTableDictionaryV2 {
 
@@ -541,18 +542,17 @@ public class TestStringHashTableDictionaryV2 {
   }
 
   /**
-   * Verifies that a dictionary whose capacity has reached {@code MAXIMUM_CAPACITY}
-   * does not attempt to double it (which would overflow {@code int}).
-   * Instead {@code threshold} is pinned to {@link Integer#MAX_VALUE} so that
-   * no further resize is attempted.
+   * Verifies that {@code resize()} throws {@link OutOfMemoryError} when the
+   * capacity has already reached {@code MAXIMUM_CAPACITY} (1 &lt;&lt; 30).
+   * Doubling such a capacity would overflow a signed 32-bit integer and produce
+   * a negative array size; fail-fast with an unrecoverable error is safer than
+   * silently degrading (which risks an infinite loop once every slot is occupied).
    *
-   * <p>Uses reflection to inject {@code capacity = MAXIMUM_CAPACITY} and then
-   * calls {@code resize()} directly, avoiding any allocation of a multi-gigabyte
-   * backing array and avoiding the {@link ArrayIndexOutOfBoundsException} that
-   * would occur if {@code add()} were called with a forged mask on a small table.
+   * <p>Uses reflection to inject {@code capacity = MAXIMUM_CAPACITY} and call
+   * {@code resize()} directly, avoiding any real multi-gigabyte allocation.
    */
   @Test
-  public void testResizeDoesNotOverflowAtMaximumCapacity() throws Exception {
+  public void testResizeThrowsOutOfMemoryErrorAtMaximumCapacity() throws Exception {
     final int maximumCapacity = 1 << 30;
 
     StringHashTableDictionaryV2 dict = new StringHashTableDictionaryV2(4, 1.0f);
@@ -563,22 +563,17 @@ public class TestStringHashTableDictionaryV2 {
     capField.setAccessible(true);
     capField.setInt(dict, maximumCapacity);
 
-    // Call resize() directly via reflection; it must recognise that
-    // capacity == MAXIMUM_CAPACITY and return immediately after pinning
-    // threshold, rather than executing `oldCapacity << 1` which would produce
-    // a negative value and cause NegativeArraySizeException.
     java.lang.reflect.Method resizeMethod =
         StringHashTableDictionaryV2.class.getDeclaredMethod("resize");
     resizeMethod.setAccessible(true);
-    resizeMethod.invoke(dict); // must not throw
 
-    // threshold must have been pinned to Integer.MAX_VALUE.
-    java.lang.reflect.Field thrField =
-        StringHashTableDictionaryV2.class.getDeclaredField("threshold");
-    thrField.setAccessible(true);
-    assertEquals(Integer.MAX_VALUE, thrField.getInt(dict));
-
-    // capacity must remain at MAXIMUM_CAPACITY (not doubled or otherwise changed).
-    assertEquals(maximumCapacity, capField.getInt(dict));
+    // resize() must throw OutOfMemoryError (wrapped by reflection as InvocationTargetException).
+    try {
+      resizeMethod.invoke(dict);
+      fail("Expected OutOfMemoryError when capacity == MAXIMUM_CAPACITY");
+    } catch (java.lang.reflect.InvocationTargetException ite) {
+      assertTrue("Expected OutOfMemoryError cause, got: " + ite.getCause(),
+          ite.getCause() instanceof OutOfMemoryError);
+    }
   }
 }

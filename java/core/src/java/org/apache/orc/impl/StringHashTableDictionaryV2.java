@@ -313,9 +313,12 @@ public class StringHashTableDictionaryV2 implements Dictionary {
    */
   private void resize() {
     if (capacity >= MAXIMUM_CAPACITY) {
-      // Cannot grow further without overflowing int; prevent repeated resize attempts.
-      threshold = Integer.MAX_VALUE;
-      return;
+      // Reaching this point requires > 750 million distinct keys in a single column,
+      // which demands tens of gigabytes of heap. Silently capping the threshold would
+      // risk an infinite loop in add() once every slot is occupied. Fail fast instead.
+      throw new OutOfMemoryError(
+          "StringHashTableDictionaryV2 capacity would exceed MAXIMUM_CAPACITY ("
+              + MAXIMUM_CAPACITY + ") on resize");
     }
 
     final int oldCapacity = this.capacity;
