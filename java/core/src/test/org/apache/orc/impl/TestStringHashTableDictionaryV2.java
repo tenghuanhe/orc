@@ -38,10 +38,7 @@ import static org.junit.jupiter.api.Assertions.fail;
 
 public class TestStringHashTableDictionaryV2 {
 
-  /**
-   * Basic test using real FNV-1a hash. Traversal order is hash/slot-dependent
-   * and is not asserted here; correctness is verified through position lookups.
-   */
+  /** Basic add/get/dedup/visit/clear using the real FNV-1a hash. */
   @Test
   public void test0() throws Exception {
     StringHashTableDictionaryV2 htDict = new StringHashTableDictionaryV2(5);
@@ -52,9 +49,7 @@ public class TestStringHashTableDictionaryV2 {
     byte[] davidBytes = new Text("David").getBytes();
     byte[] easonBytes = new Text("Eason").getBytes();
 
-    // Initial state: hashTable and slotHashes are allocated (2 * capacity * 4 bytes);
-    // byteArray, keyOffsets, and keyLengths have no chunks yet.
-    // initialCapacity=5 → tableSizeFor(5)=8 → 2 * 8 * 4 = 64 bytes
+    // initialCapacity=5 → capacity=8; only hashTable+slotHashes allocated → 2*8*4=64 bytes
     assertEquals(2L * 8 * Integer.BYTES, htDict.getSizeInBytes());
     assertEquals(0, htDict.add(aliceBytes, 0, aliceBytes.length));
     assertEquals(1, htDict.add(bobBytes,   0, bobBytes.length));
@@ -72,7 +67,7 @@ public class TestStringHashTableDictionaryV2 {
 
     assertEquals(3, htDict.size());
 
-    // The fourth and fifth elements — capacity=8, threshold=6, so no resize yet.
+    // capacity=8, threshold=6: no resize before the 6th distinct key
     assertEquals(3, htDict.add(davidBytes, 0, davidBytes.length));
     htDict.getText(text, 3);
     assertEquals("David", text.toString());
@@ -82,7 +77,6 @@ public class TestStringHashTableDictionaryV2 {
 
     assertEquals(5, htDict.size());
 
-    // Re-verify all positions via getText.
     htDict.getText(text, 0);
     assertEquals("Alice", text.toString());
     htDict.getText(text, 1);
@@ -90,8 +84,7 @@ public class TestStringHashTableDictionaryV2 {
     htDict.getText(text, 2);
     assertEquals("Cindy", text.toString());
 
-    // Traversal order depends on FNV-1a slot placement and is an implementation
-    // detail. Verify all entries are present with the correct original positions.
+    // Traversal order is slot-dependent; verify presence and correct original positions.
     Map<String, Integer> positions = new HashMap<>();
     htDict.visit(ctx -> positions.put(ctx.getText().toString(), ctx.getOriginalPosition()));
     assertEquals(Set.of("Alice", "Bob", "Cindy", "David", "Eason"), positions.keySet());
@@ -106,20 +99,15 @@ public class TestStringHashTableDictionaryV2 {
   }
 
   /**
-   * Extension of {@link StringHashTableDictionaryV2} for testing: overrides
-   * {@link #getIndex} to return the numeric prefix of each key as the initial
-   * slot. This makes traversal order deterministic and easy to reason about.
+   * Overrides {@code getIndex} to use the key's numeric prefix byte as the
+   * initial slot, making traversal order deterministic.
    */
   private static class SimpleHashDictionaryV2 extends StringHashTableDictionaryV2 {
     SimpleHashDictionaryV2(int initialCapacity) {
       super(initialCapacity);
     }
 
-    /**
-     * Returns the numeric prefix byte of the key as the slot index.
-     * All keys used in {@link #test1} have a single-digit decimal prefix
-     * (e.g. "0_David", "1_Cindy") so their initial slots are 0–4.
-     */
+    /** Maps key "N_Name" to slot N via the leading ASCII digit. */
     @Override
     int getIndex(byte[] bytes, int offset, int length, int hash) {
       return (char) bytes[offset] - '0';
@@ -128,20 +116,13 @@ public class TestStringHashTableDictionaryV2 {
 
   /**
    * Deterministic traversal test using {@link SimpleHashDictionaryV2}.
+   * capacity=8, threshold=6; keys "0_David"–"4_Eason" land at slots 0–4
+   * without collision and without a resize, so visit order is predictable.
    *
-   * <p>With {@code initialCapacity=5}, {@link StringHashTableDictionaryV2} rounds
-   * up to the next power-of-two: {@code capacity=8}, {@code threshold=6}.
-   * The overridden {@code getIndex} maps each key to its numeric prefix as its
-   * initial slot (0–4), so all five entries are placed without collision and
-   * no resize occurs. Traversal visits slots 0..7 in order, yielding a
-   * deterministic sequence.
-   *
-   * <p>This test deliberately keeps the insertion count (5) below the resize
-   * threshold (6). {@link StringHashTableDictionaryV2#resize()} bypasses
-   * {@link StringHashTableDictionaryV2#getIndex} and reuses stored hash
-   * fingerprints directly, so a subclass that derives slot positions from key
-   * bytes would see inconsistent placement after a resize. See the
-   * {@code getIndex} Javadoc for details.
+   * <p>Size is kept below the resize threshold intentionally: {@code resize()}
+   * bypasses {@code getIndex} and uses stored fingerprints directly, so a
+   * subclass overriding slot placement would see inconsistent positions after
+   * a rehash.
    */
   @Test
   public void test1() throws Exception {
@@ -169,7 +150,6 @@ public class TestStringHashTableDictionaryV2 {
     hashTableDictionary.getText(text, 4);
     assertEquals("4_Eason", text.toString());
 
-    // Re-verify previously inserted strings.
     hashTableDictionary.getText(text, 0);
     assertEquals("2_Alice", text.toString());
     hashTableDictionary.getText(text, 1);
@@ -192,17 +172,13 @@ public class TestStringHashTableDictionaryV2 {
   // -------------------------------------------------------------------------
 
   /**
-   * Verifies that {@code resize()} correctly rehashes all entries and every
-   * key remains accessible at its original position after two consecutive
-   * resizes.
+   * Verifies that all keys remain accessible at their original positions after
+   * two consecutive resizes.
    *
-   * <p>With {@code initialCapacity=2}: capacity=2, threshold=1.
+   * <p>initialCapacity=2, threshold=1:
    * <ul>
-   *   <li>add("apple")  – size=0 &lt; 1 → no resize; size→1</li>
-   *   <li>add("banana") – size=1 ≥ 1 → resize → capacity=4, threshold=3; size→2</li>
-   *   <li>add("cherry") – size=2 &lt; 3 → no resize; size→3</li>
-   *   <li>add("date")   – size=3 ≥ 3 → resize → capacity=8, threshold=6; size→4</li>
-   *   <li>add("fig")    – size=4 &lt; 6 → no resize; size→5</li>
+   *   <li>"banana" triggers the 1st resize → capacity=4, threshold=3</li>
+   *   <li>"date"   triggers the 2nd resize → capacity=8, threshold=6</li>
    * </ul>
    */
   @Test
@@ -216,7 +192,7 @@ public class TestStringHashTableDictionaryV2 {
     assertEquals(4, dict.add(new Text("fig")));
     assertEquals(5, dict.size());
 
-    // All keys must be retrievable at their original positions after two resizes.
+    // All positions stable after two resizes.
     Text t = new Text();
     dict.getText(t, 0); assertEquals("apple",  t.toString());
     dict.getText(t, 1); assertEquals("banana", t.toString());
@@ -224,7 +200,6 @@ public class TestStringHashTableDictionaryV2 {
     dict.getText(t, 3); assertEquals("date",   t.toString());
     dict.getText(t, 4); assertEquals("fig",    t.toString());
 
-    // Duplicate detection must still work correctly after resize.
     assertEquals(0, dict.add(new Text("apple")));
     assertEquals(1, dict.add(new Text("banana")));
     assertEquals(2, dict.add(new Text("cherry")));
@@ -238,12 +213,9 @@ public class TestStringHashTableDictionaryV2 {
   // -------------------------------------------------------------------------
 
   /**
-   * Extension that forces all keys to start probing at slot 0, creating a
-   * deterministic left-to-right collision chain.
-   *
-   * <p>Keep insertions below the resize threshold so that the overridden
-   * {@code getIndex} is never bypassed by
-   * {@link StringHashTableDictionaryV2#resize()}.
+   * Forces all keys to slot 0 for deterministic left-to-right collision-chain
+   * testing. Keep size below the resize threshold — {@code resize()} bypasses
+   * {@code getIndex} when rehashing.
    */
   private static class AllSlotZeroDictionary extends StringHashTableDictionaryV2 {
     AllSlotZeroDictionary(int initialCapacity) {
@@ -257,21 +229,13 @@ public class TestStringHashTableDictionaryV2 {
   }
 
   /**
-   * Verifies linear probing and FNV-1a fingerprint fast-rejection.
-   *
-   * <p>All insertions start at slot 0 ({@link AllSlotZeroDictionary}), creating
-   * the chain: "first"→slot 0, "second"→slot 1, "third"→slot 2.
-   *
-   * <p>Duplicate lookups exercise the full probe chain:
-   * <ul>
-   *   <li>"first" duplicate – fingerprint match at slot 0 (direct hit)</li>
-   *   <li>"second" duplicate – fingerprint mismatch at slot 0 → probe → hit slot 1</li>
-   *   <li>"third" duplicate – fingerprint mismatches at slots 0,1 → probe → hit slot 2</li>
-   * </ul>
+   * Verifies linear probing and FNV-1a fingerprint fast-rejection using
+   * {@link AllSlotZeroDictionary}: all keys start at slot 0, so each new
+   * key probes past all earlier ones.
    */
   @Test
   public void testLinearProbingAndFingerprintRejection() throws Exception {
-    // capacity=8, threshold=6; keep size ≤ 5 to stay below the threshold.
+    // capacity=8, threshold=6; keep size ≤ 3 to stay well below the threshold.
     AllSlotZeroDictionary dict = new AllSlotZeroDictionary(8);
 
     assertEquals(0, dict.add(new Text("first")));
@@ -280,9 +244,9 @@ public class TestStringHashTableDictionaryV2 {
     assertEquals(3, dict.size());
 
     // Duplicate detection through the full probe chain.
-    assertEquals(0, dict.add(new Text("first")));   // direct hit at slot 0
-    assertEquals(1, dict.add(new Text("second")));  // skip slot 0 (fingerprint mismatch), hit slot 1
-    assertEquals(2, dict.add(new Text("third")));   // skip slots 0,1, hit slot 2
+    assertEquals(0, dict.add(new Text("first")));   // fingerprint match at slot 0
+    assertEquals(1, dict.add(new Text("second")));  // mismatch at slot 0 → probe → slot 1
+    assertEquals(2, dict.add(new Text("third")));   // mismatches at slots 0,1 → slot 2
     assertEquals(3, dict.size());                   // no new entries
 
     // Traversal order: slots 0→1→2 hold "first"(0), "second"(1), "third"(2).
@@ -293,10 +257,7 @@ public class TestStringHashTableDictionaryV2 {
   // getText(int) / writeTo() coverage
   // -------------------------------------------------------------------------
 
-  /**
-   * Tests the {@link StringHashTableDictionaryV2#getText(int)} overload that
-   * returns a {@link ByteBuffer}.
-   */
+  /** Tests the {@code getText(int)} overload that returns a {@link ByteBuffer}. */
   @Test
   public void testGetTextByteBuffer() {
     StringHashTableDictionaryV2 dict = new StringHashTableDictionaryV2(4);
@@ -314,9 +275,7 @@ public class TestStringHashTableDictionaryV2 {
     assertEquals("world", new String(bytes1, StandardCharsets.UTF_8));
   }
 
-  /**
-   * Tests {@link StringHashTableDictionaryV2#writeTo(java.io.OutputStream, int)}.
-   */
+  /** Tests {@code writeTo(OutputStream, int)}. */
   @Test
   public void testWriteTo() throws Exception {
     StringHashTableDictionaryV2 dict = new StringHashTableDictionaryV2(4);
@@ -338,10 +297,7 @@ public class TestStringHashTableDictionaryV2 {
   // Edge cases: empty string, byte offset, small capacity, load factor
   // -------------------------------------------------------------------------
 
-  /**
-   * Verifies that an empty (zero-length) key is stored, retrieved, and
-   * de-duplicated correctly.
-   */
+  /** Verifies that a zero-length key is stored, retrieved, and de-duplicated correctly. */
   @Test
   public void testEmptyString() throws Exception {
     StringHashTableDictionaryV2 dict = new StringHashTableDictionaryV2(4);
@@ -359,11 +315,7 @@ public class TestStringHashTableDictionaryV2 {
     assertEquals(0, buf.remaining());
   }
 
-  /**
-   * Verifies that {@code add(byte[], offset, length)} with a non-zero
-   * {@code offset} correctly identifies duplicates regardless of the buffer
-   * position the bytes reside in.
-   */
+  /** Verifies duplicate detection when the same key bytes reside at different buffer offsets. */
   @Test
   public void testAddBytesWithNonZeroOffset() throws Exception {
     StringHashTableDictionaryV2 dict = new StringHashTableDictionaryV2(4);
@@ -381,9 +333,8 @@ public class TestStringHashTableDictionaryV2 {
   }
 
   /**
-   * Verifies that {@code initialCapacity} values of 0 and 1 both produce a
-   * starting table capacity of 1 (via {@code tableSizeFor}), and that the
-   * table grows on-demand as keys are inserted.
+   * Verifies that initialCapacity=0 and =1 both produce capacity=1, and the
+   * table grows on demand.
    */
   @Test
   public void testSmallInitialCapacity() throws Exception {
@@ -392,7 +343,7 @@ public class TestStringHashTableDictionaryV2 {
       // capacity=1; hashTable[1] + slotHashes[1] = 2*1*4 = 8 bytes
       assertEquals(2L * 1 * Integer.BYTES, dict.getSizeInBytes());
 
-      // threshold=0, so every add triggers resize until stable
+      // threshold=0, so every add triggers a resize
       assertEquals(0, dict.add(new Text("x")));
       assertEquals(1, dict.add(new Text("y")));
       assertEquals(2, dict.add(new Text("z")));
@@ -403,7 +354,6 @@ public class TestStringHashTableDictionaryV2 {
       dict.getText(t, 1); assertEquals("y", t.toString());
       dict.getText(t, 2); assertEquals("z", t.toString());
 
-      // Duplicate detection must work after multiple resizes.
       assertEquals(0, dict.add(new Text("x")));
       assertEquals(1, dict.add(new Text("y")));
       assertEquals(2, dict.add(new Text("z")));
@@ -412,19 +362,17 @@ public class TestStringHashTableDictionaryV2 {
   }
 
   /**
-   * Verifies that a custom load factor controls when resize is triggered.
-   *
-   * <p>With {@code initialCapacity=4} and {@code loadFactor=0.5}:
-   * capacity=4, threshold=2. The third insertion triggers resize.
+   * Verifies that a custom load factor controls when resize fires.
+   * initialCapacity=4, loadFactor=0.5: threshold=2, so the 3rd insertion triggers resize.
    */
   @Test
   public void testCustomLoadFactor() throws Exception {
     StringHashTableDictionaryV2 dict = new StringHashTableDictionaryV2(4, 0.5f);
-    // threshold = (int)(4 * 0.5) = 2
+    // threshold = min(ceil(4*0.5), 3) = 2
 
     assertEquals(0, dict.add(new Text("alpha")));
     assertEquals(1, dict.add(new Text("beta")));
-    // size=2 ≥ threshold=2 → resize triggered on next add
+    // size=2 ≥ threshold=2 → resize triggered before the next add
     assertEquals(2, dict.add(new Text("gamma")));
     assertEquals(3, dict.size());
 
@@ -433,7 +381,6 @@ public class TestStringHashTableDictionaryV2 {
     dict.getText(t, 1); assertEquals("beta",  t.toString());
     dict.getText(t, 2); assertEquals("gamma", t.toString());
 
-    // Duplicate detection works after resize.
     assertEquals(0, dict.add(new Text("alpha")));
     assertEquals(1, dict.add(new Text("beta")));
     assertEquals(2, dict.add(new Text("gamma")));
@@ -441,22 +388,18 @@ public class TestStringHashTableDictionaryV2 {
   }
 
   // -------------------------------------------------------------------------
-  // clear() + reuse coverage
+  // clear() + reuse
   // -------------------------------------------------------------------------
 
   /**
-   * Verifies that {@link StringHashTableDictionaryV2#clear()} resets the
-   * logical state (size, key data) without shrinking the hash-table arrays,
-   * and that subsequent insertions build a fresh dictionary from position 0.
-   *
-   * <p>Also confirms that keys present before {@code clear()} are no longer
-   * found after it, and are re-inserted as new entries if added again.
+   * Verifies that {@code clear()} resets size and key data without shrinking
+   * the hash-table arrays, and that re-insertion starts positions from 0.
    */
   @Test
   public void testClearAndReuseAfterResize() throws Exception {
     StringHashTableDictionaryV2 dict = new StringHashTableDictionaryV2(2);
 
-    // Trigger at least one resize so the post-clear capacity is larger than initial.
+    // trigger a resize
     assertEquals(0, dict.add(new Text("one")));
     assertEquals(1, dict.add(new Text("two")));
     assertEquals(2, dict.add(new Text("three")));
@@ -464,8 +407,7 @@ public class TestStringHashTableDictionaryV2 {
 
     dict.clear();
     assertEquals(0, dict.size());
-    // Hash-table arrays are kept (capacity stays doubled); dynamic key arrays
-    // are freed, so only the flat int[] contribute to the in-memory footprint.
+    // hash-table arrays retained; key storage freed → only flat int[] contribute
     assertTrue(dict.getSizeInBytes() > 0);
 
     // Re-add different items; positions restart from 0.

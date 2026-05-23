@@ -26,76 +26,56 @@ import java.nio.ByteBuffer;
 import java.util.Arrays;
 
 /**
- * Optimized open-addressing (linear-probing) hash-table dictionary for string columns.
- * Strings are stored as UTF-8 bytes in a single append-only byte array.
+ * Open-addressing (linear-probing) hash-table dictionary for string columns.
+ * Strings are stored contiguously as UTF-8 bytes in an append-only byte array.
  *
- * <p>Performance improvements over {@link StringHashTableDictionary} (chaining):
+ * <p>Improvements over {@link StringHashTableDictionary} (chaining):
  * <ul>
- *   <li><b>Flat {@code int[]} hash table</b> – eliminates the array of
- *       {@link DynamicIntArray} bucket objects and their per-element
- *       chunk-division overhead.</li>
- *   <li><b>Power-of-two capacity</b> – {@code hash &amp; mask} replaces
- *       {@code Math.floorMod(hash, capacity)}, turning a software division
- *       into a single bitwise AND.</li>
- *   <li><b>FNV-1a hash function</b> – better bit avalanche than the previous
- *       polynomial, reducing average probe-chain length.</li>
- *   <li><b>Per-slot hash fingerprint</b> ({@code slotHashes}) – lets the
- *       hot loop reject non-matching slots without touching key bytes.</li>
- *   <li><b>Explicit key-length storage</b> ({@code keyLengths}) – avoids
- *       computing length from two adjacent offset lookups on every probe.</li>
- *   <li><b>O(capacity) {@code clear()}</b> – {@link Arrays#fill} on the flat
- *       array instead of re-allocating thousands of bucket objects.</li>
- *   <li><b>O(size) {@code resize()}</b> – allocates only two new {@code int[]}
- *       arrays instead of {@code newCapacity} {@link DynamicIntArray} objects.</li>
+ *   <li><b>Flat {@code int[]} table</b> – no per-bucket {@link DynamicIntArray} objects.</li>
+ *   <li><b>Power-of-two capacity</b> – {@code hash &amp; mask} replaces {@code floorMod}.</li>
+ *   <li><b>FNV-1a hash</b> – stronger avalanche reduces average probe-chain length.</li>
+ *   <li><b>Per-slot fingerprint</b> ({@code slotHashes}) – rejects mismatches before byte comparison.</li>
+ *   <li><b>Explicit key lengths</b> ({@code keyLengths}) – enables early-exit on length mismatch.</li>
+ *   <li><b>O(capacity) {@code clear()}</b> – {@link Arrays#fill} on the flat array.</li>
+ *   <li><b>O(size) {@code resize()}</b> – allocates two new arrays, not {@code newCapacity} objects.</li>
  * </ul>
  *
- * <p>This implementation is not thread-safe.
+ * <p>Not thread-safe.
  * @since 1.9.0
  * @see StringHashTableDictionary
  */
 public class StringHashTableDictionaryV2 implements Dictionary {
 
-  /** Sentinel value meaning "empty slot". Key indices are stored as {@code keyIndex + 1}. */
+  /** Empty-slot sentinel; occupied slots store {@code keyIndex + 1}. */
   private static final int EMPTY = 0;
 
   private static final float DEFAULT_LOAD_FACTOR = 0.75f;
 
-  /**
-   * The maximum hash-table capacity, mirroring {@code java.util.HashMap#MAXIMUM_CAPACITY}.
-   * It must be a power of two and must be &le; {@code 1 << 30} because doubling a
-   * capacity larger than this would overflow a signed 32-bit integer.
-   */
+  /** Max capacity (power of two); doubling beyond this overflows a signed 32-bit int. */
   private static final int MAXIMUM_CAPACITY = 1 << 30;
 
 
-  // --- Key storage (never reorganised; only appended) ---
+  // --- Key storage (append-only) ---
 
-  /** Raw UTF-8 bytes of all keys, stored contiguously. */
+  /** All key bytes stored contiguously. */
   private final DynamicByteArray byteArray = new DynamicByteArray();
 
-  /** Byte offset of each key inside {@link #byteArray}, indexed by keyIndex. */
+  /** Start offset of each key in {@link #byteArray}, indexed by keyIndex. */
   private final DynamicIntArray keyOffsets;
 
   /**
    * Byte length of each key, indexed by keyIndex.
-   * Stored explicitly so that equality checks need only one lookup instead
-   * of two adjacent offset reads, and length can short-circuit before
-   * a full byte comparison.
+   * Stored explicitly to avoid computing length from adjacent offsets and to
+   * enable early-exit on length mismatch during probing.
    */
   private final DynamicIntArray keyLengths;
 
   // --- Open-addressing hash table ---
 
-  /**
-   * Flat hash table. {@code hashTable[slot] == EMPTY} means the slot is
-   * unoccupied; otherwise it holds {@code keyIndex + 1}.
-   */
+  /** {@code hashTable[slot] == EMPTY} → unoccupied; otherwise {@code keyIndex + 1}. */
   private int[] hashTable;
 
-  /**
-   * FNV-1a fingerprint of the key stored in each slot. A fingerprint mismatch
-   * allows most non-matching probes to skip the full byte comparison.
-   */
+  /** FNV-1a fingerprint per slot; allows the probe loop to skip byte comparison on mismatch. */
   private int[] slotHashes;
 
   // --- Table metadata ---
@@ -106,12 +86,12 @@ public class StringHashTableDictionaryV2 implements Dictionary {
   /** {@code capacity - 1}; used for fast {@code hash & mask} modulo. */
   private int mask;
 
-  /** Number of distinct keys currently stored. */
+  /** Number of distinct keys stored. */
   private int size;
 
   private final float loadFactor;
 
-  /** Trigger a resize when {@link #size} reaches this value. */
+  /** Resize when {@link #size} reaches this value. */
   private int threshold;
 
   // -------------------------------------------------------------------------
@@ -152,8 +132,7 @@ public class StringHashTableDictionaryV2 implements Dictionary {
     byteArray.clear();
     keyOffsets.clear();
     keyLengths.clear();
-    // Zero out the occupied-slot markers; slotHashes values are irrelevant
-    // for empty slots and do not need to be cleared.
+    // slotHashes need not be cleared; values in empty slots are never read
     Arrays.fill(hashTable, EMPTY);
     size = 0;
   }
@@ -233,10 +212,8 @@ public class StringHashTableDictionaryV2 implements Dictionary {
   // -------------------------------------------------------------------------
 
   /**
-   * FNV-1a (32-bit) hash. Compared with a Horner polynomial (multiplier 31),
-   * FNV-1a has stronger bit avalanche, reducing the average probe-chain length.
-   * The result is guaranteed non-zero so it can serve directly as the
-   * {@link #slotHashes} fingerprint.
+   * FNV-1a 32-bit hash. Result is always non-zero (0 replaced by 1) so it
+   * doubles as the {@link #slotHashes} fingerprint without ambiguity.
    */
   private static int fnvHash(byte[] bytes, int offset, int length) {
     int h = 0x811c9dc5;
@@ -249,34 +226,18 @@ public class StringHashTableDictionaryV2 implements Dictionary {
   }
 
   /**
-   * Returns the initial slot index for the given key and its pre-computed hash.
-   * The default implementation uses a power-of-two modulo ({@code hash & mask}),
-   * which the JIT can emit as a single AND instruction.
+   * Returns {@code hash & mask} as the initial probe slot.
    *
-   * <p>Package-private so that test subclasses can override the slot-selection
-   * strategy to make collision behaviour deterministic. Subclasses that need
-   * the raw key bytes (e.g. to derive a deterministic slot from the key content)
-   * should override this method; the {@code hash} parameter may be ignored.
-   *
-   * <p><strong>Important limitation for subclasses:</strong> this method is
-   * called only from {@link #add}. The {@link #resize} path bypasses it and
-   * always places rehashed entries using {@code storedHash & mask} directly,
-   * because the key bytes are not re-read during rehashing. Consequently, if a
-   * subclass overrides this method to derive the initial slot from the key
-   * content rather than from the hash, the slot placement after a resize will
-   * diverge from what {@link #add} would choose, potentially causing duplicate
-   * insertions after the resize. Test subclasses should therefore be designed
-   * to keep the number of insertions below the resize threshold.
+   * <p>Package-private for test subclasses that need deterministic slot placement.
+   * <strong>Important:</strong> {@link #resize} bypasses this method and uses
+   * stored fingerprints directly, so subclass overrides do not affect placement
+   * after a resize. Test subclasses must keep size below the resize threshold.
    */
   int getIndex(final byte[] bytes, final int offset, final int length, final int hash) {
     return hash & mask;
   }
 
-  /**
-   * Convenience overload: computes the FNV-1a hash internally and delegates.
-   * Callers inside {@link #add} should prefer the four-argument overload to
-   * avoid computing the hash twice.
-   */
+  /** Computes the FNV-1a hash then delegates to {@link #getIndex(byte[], int, int, int)}. */
   int getIndex(final byte[] bytes, final int offset, final int length) {
     return getIndex(bytes, offset, length, fnvHash(bytes, offset, length));
   }
@@ -298,22 +259,12 @@ public class StringHashTableDictionaryV2 implements Dictionary {
   }
 
   /**
-   * Returns the maximum number of entries that can be stored before the next
-   * resize, mirroring {@code it.unimi.dsi.fastutil.HashCommon#maxFill}.
+   * Max entries before resize: {@code min(ceil(n * f), n - 1)}, mirroring fastutil's
+   * {@code HashCommon#maxFill}.
    *
-   * <p>Uses {@link Math#ceil} (not truncation) to avoid precision loss when
-   * converting the {@code float} load factor to {@code double}.
-   *
-   * <p>The {@code n - 1} cap is the <strong>critical safety property</strong>:
-   * linear probing requires at least one permanently empty slot so that the
-   * probe loop in {@link #add} terminates even for keys not present in the
-   * table.  Without this cap, a caller passing {@code loadFactor &ge; 1.0}
-   * could fill every slot, causing an infinite loop on the next lookup of a
-   * missing key.
-   *
-   * @param n the current table capacity (power of two).
-   * @param f the load factor.
-   * @return the maximum fill count before resize ({@code <= n - 1}).
+   * <p>The {@code n - 1} cap ensures at least one permanently empty slot — required by
+   * linear probing to terminate a failed search even when {@code f >= 1.0}.
+   * Cast to {@code double} (not {@code float}) avoids precision loss on large tables.
    */
   private static int maxFill(final int n, final float f) {
     return Math.min((int) Math.ceil(n * (double) f), n - 1);
@@ -322,21 +273,14 @@ public class StringHashTableDictionaryV2 implements Dictionary {
   /**
    * Doubles the table capacity and rehashes all existing entries.
    *
-   * <p>If {@code capacity} has already reached {@link #MAXIMUM_CAPACITY} ({@code 1 << 30}),
-   * no further resize is performed; the threshold is instead raised to
-   * {@link Integer#MAX_VALUE} so that {@link #add} never triggers another
-   * resize attempt.  This mirrors the behaviour of {@code java.util.HashMap}.
-   * In Java, {@code (1 << 30) << 1} silently wraps to {@code Integer.MIN_VALUE}
-   * (JLS §15.19: shift amount is taken mod 32 for {@code int}), and
-   * {@code new int[Integer.MIN_VALUE]} would immediately throw
-   * {@link NegativeArraySizeException}, so the guard is required.
+   * <p>If capacity is already {@link #MAXIMUM_CAPACITY} ({@code 1 << 30}), sets
+   * {@code threshold = Integer.MAX_VALUE} and returns without resizing.
+   * ({@code (1<<30)<<1} would silently wrap to {@code Integer.MIN_VALUE} in Java,
+   * causing {@code new int[Integer.MIN_VALUE]} to throw {@link NegativeArraySizeException}.)
+   * The sentinel is safe because {@code size} is bounded by capacity.
    *
-   * <p>Note: {@link #getIndex} is <em>not</em> called during rehashing.
-   * Each occupied slot is repositioned using its stored FNV-1a fingerprint
-   * ({@code slotHashes[i] & newMask}) directly, without re-reading key bytes.
-   * This avoids the cost of re-reading key bytes and recomputing hashes, but
-   * means that any {@link #getIndex} override in a test subclass will not
-   * affect slot placement after a resize.
+   * <p>Rehashing uses stored fingerprints ({@code slotHashes[i] & newMask}) directly —
+   * {@link #getIndex} is not called, so subclass overrides do not affect placement after resize.
    */
   private void resize() {
     final int oldCapacity = this.capacity;
@@ -355,8 +299,7 @@ public class StringHashTableDictionaryV2 implements Dictionary {
     final int[] newHashTable = new int[newCapacity];
     final int[] newSlotHashes = new int[newCapacity];
 
-    // Update capacity and mask before the rehash loop so that this.mask
-    // reflects the new (doubled) capacity when computing newSlot below.
+    // Update state before rehash loop so this.mask reflects the new capacity.
     this.capacity = newCapacity;
     this.mask = newCapacity - 1;
     this.hashTable = newHashTable;
@@ -368,8 +311,7 @@ public class StringHashTableDictionaryV2 implements Dictionary {
       if (oldHashTable[i] == EMPTY) {
         continue;
       }
-      // The FNV-1a hash is already stored in oldSlotHashes[i]; reuse it
-      // directly instead of re-reading key bytes and recomputing the hash.
+      // Reuse stored fingerprint — no need to re-read key bytes or recompute hash.
       int newSlot = oldSlotHashes[i] & this.mask;
       while (newHashTable[newSlot] != EMPTY) {
         newSlot = (newSlot + 1) & this.mask;
