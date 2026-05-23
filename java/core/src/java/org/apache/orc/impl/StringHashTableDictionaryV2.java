@@ -61,6 +61,13 @@ public class StringHashTableDictionaryV2 implements Dictionary {
   private static final float DEFAULT_LOAD_FACTOR = 0.75f;
 
   /**
+   * The maximum hash-table capacity, mirroring {@code java.util.HashMap#MAXIMUM_CAPACITY}.
+   * It must be a power of two and must be &le; {@code 1 << 30} because doubling a
+   * capacity larger than this would overflow a signed 32-bit integer.
+   */
+  private static final int MAXIMUM_CAPACITY = 1 << 30;
+
+  /**
    * The maximum table size to allocate, matching {@link java.util.Hashtable}.
    */
   private static final int MAX_ARRAY_SIZE = Integer.MAX_VALUE - 8;
@@ -287,15 +294,23 @@ public class StringHashTableDictionaryV2 implements Dictionary {
   // Internal helpers
   // -------------------------------------------------------------------------
 
-  /** Returns the smallest power of two &ge; {@code n} (minimum 1). */
+  /** Returns the smallest power of two &ge; {@code n} (minimum 1, maximum {@link #MAXIMUM_CAPACITY}). */
   private static int tableSizeFor(int n) {
     if (n <= 1) return 1;
     int p = Integer.highestOneBit(n - 1) << 1;
-    return (p > 0) ? p : MAX_ARRAY_SIZE;
+    return (p > 0 && p <= MAXIMUM_CAPACITY) ? p : MAXIMUM_CAPACITY;
   }
 
   /**
    * Doubles the table capacity and rehashes all existing entries.
+   *
+   * <p>If {@code capacity} has already reached {@code 1 << 30}, the shift
+   * {@code oldCapacity << 1} produces a negative value and
+   * {@code new int[negativeSize]} immediately throws
+   * {@link NegativeArraySizeException} – an unrecoverable failure that
+   * prevents an infinite loop in {@link #add}.  Reaching this boundary
+   * requires inserting more than 750 million distinct keys, which exhausts
+   * tens of gigabytes of heap long before the table is full in practice.
    *
    * <p>Note: {@link #getIndex} is <em>not</em> called during rehashing.
    * Each occupied slot is repositioned using its stored FNV-1a fingerprint
@@ -305,12 +320,6 @@ public class StringHashTableDictionaryV2 implements Dictionary {
    * affect slot placement after a resize.
    */
   private void resize() {
-    if (capacity >= MAX_ARRAY_SIZE) {
-      // Cannot grow further; prevent repeated resize attempts.
-      threshold = Integer.MAX_VALUE;
-      return;
-    }
-
     final int oldCapacity = this.capacity;
     final int[] oldHashTable = this.hashTable;
     final int[] oldSlotHashes = this.slotHashes;

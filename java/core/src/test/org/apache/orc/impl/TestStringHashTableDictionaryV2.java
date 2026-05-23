@@ -32,6 +32,7 @@ import java.util.Set;
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assertions.fail;
 
 public class TestStringHashTableDictionaryV2 {
 
@@ -505,5 +506,74 @@ public class TestStringHashTableDictionaryV2 {
     // After insertions, byteArray, keyOffsets, and keyLengths have allocated
     // chunks, so the total must exceed the initial hash-table-only footprint.
     assertTrue(dict.getSizeInBytes() > initialSize);
+  }
+
+  // -------------------------------------------------------------------------
+  // Resize overflow boundary
+  // -------------------------------------------------------------------------
+
+  /**
+   * Verifies that {@code tableSizeFor} never returns a value larger than
+   * {@code MAXIMUM_CAPACITY (1 << 30)}, even for extremely large inputs,
+   * so that a subsequent left-shift in {@code resize()} cannot overflow.
+   *
+   * <p>Uses reflection to call the private static method directly.
+   */
+  @Test
+  public void testTableSizeForCapsAtMaximumCapacity() throws Exception {
+    final int maximumCapacity = 1 << 30;
+
+    java.lang.reflect.Method m =
+        StringHashTableDictionaryV2.class.getDeclaredMethod("tableSizeFor", int.class);
+    m.setAccessible(true);
+
+    // Values well beyond MAXIMUM_CAPACITY must be capped.
+    for (int n : new int[]{maximumCapacity, maximumCapacity + 1,
+                           Integer.MAX_VALUE - 1, Integer.MAX_VALUE}) {
+      int result = (int) m.invoke(null, n);
+      assertEquals(maximumCapacity, result,
+          "tableSizeFor(" + n + ") should be capped at MAXIMUM_CAPACITY");
+    }
+
+    // A non-power-of-two just above 2^29 must be rounded up to 2^30.
+    assertEquals(maximumCapacity, (int) m.invoke(null, (1 << 29) + 1));
+    // An exact power-of-two (2^29) must be returned unchanged.
+    assertEquals(1 << 29,         (int) m.invoke(null, 1 << 29));
+  }
+
+  /**
+   * Verifies that {@code resize()} throws {@link NegativeArraySizeException} when
+   * {@code capacity} is already {@code 1 << 30}.  The left-shift
+   * {@code oldCapacity << 1} then produces {@link Integer#MIN_VALUE} (negative),
+   * and {@code new int[negativeValue]} throws immediately — preventing any
+   * possibility of an infinite loop in {@link StringHashTableDictionaryV2#add}.
+   *
+   * <p>Uses reflection to inject {@code capacity = MAXIMUM_CAPACITY} and call
+   * {@code resize()} directly, avoiding any real multi-gigabyte allocation.
+   */
+  @Test
+  public void testResizeThrowsNegativeArraySizeAtMaximumCapacity() throws Exception {
+    final int maximumCapacity = 1 << 30;
+
+    StringHashTableDictionaryV2 dict = new StringHashTableDictionaryV2(4, 1.0f);
+
+    // Forge capacity = MAXIMUM_CAPACITY so that resize() observes the boundary.
+    java.lang.reflect.Field capField =
+        StringHashTableDictionaryV2.class.getDeclaredField("capacity");
+    capField.setAccessible(true);
+    capField.setInt(dict, maximumCapacity);
+
+    java.lang.reflect.Method resizeMethod =
+        StringHashTableDictionaryV2.class.getDeclaredMethod("resize");
+    resizeMethod.setAccessible(true);
+
+    // resize() must throw NegativeArraySizeException (wrapped by reflection).
+    try {
+      resizeMethod.invoke(dict);
+      fail("Expected NegativeArraySizeException when capacity == MAXIMUM_CAPACITY");
+    } catch (java.lang.reflect.InvocationTargetException ite) {
+      assertTrue(ite.getCause() instanceof NegativeArraySizeException,
+          "Expected NegativeArraySizeException cause, got: " + ite.getCause());
+    }
   }
 }
