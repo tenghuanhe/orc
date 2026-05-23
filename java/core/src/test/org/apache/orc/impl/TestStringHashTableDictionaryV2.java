@@ -506,4 +506,82 @@ public class TestStringHashTableDictionaryV2 {
     // chunks, so the total must exceed the initial hash-table-only footprint.
     assertTrue(dict.getSizeInBytes() > initialSize);
   }
+
+  // -------------------------------------------------------------------------
+  // Resize overflow boundary (MAXIMUM_CAPACITY guard)
+  // -------------------------------------------------------------------------
+
+  /**
+   * Verifies that {@code tableSizeFor} never returns a value larger than
+   * {@code MAXIMUM_CAPACITY (1 << 30)}, even for extremely large inputs,
+   * so that a subsequent left-shift in {@code resize()} cannot overflow.
+   *
+   * <p>Uses reflection to call the private static method directly.
+   */
+  @Test
+  public void testTableSizeForCapsAtMaximumCapacity() throws Exception {
+    final int maximumCapacity = 1 << 30;
+
+    java.lang.reflect.Method m =
+        StringHashTableDictionaryV2.class.getDeclaredMethod("tableSizeFor", int.class);
+    m.setAccessible(true);
+
+    // Values well beyond MAXIMUM_CAPACITY must be capped.
+    for (int n : new int[]{maximumCapacity, maximumCapacity + 1,
+                           Integer.MAX_VALUE - 1, Integer.MAX_VALUE}) {
+      int result = (int) m.invoke(null, n);
+      assertEquals(maximumCapacity, result,
+          "tableSizeFor(" + n + ") should be capped at MAXIMUM_CAPACITY");
+    }
+
+    // Power-of-two inputs up to MAXIMUM_CAPACITY must be returned as-is.
+    assertEquals(maximumCapacity, (int) m.invoke(null, maximumCapacity));
+    assertEquals(1 << 29,         (int) m.invoke(null, (1 << 29) + 1));
+  }
+
+  /**
+   * Verifies that a dictionary whose capacity has reached {@code MAXIMUM_CAPACITY}
+   * does not attempt to double it (which would overflow {@code int}).
+   * Instead {@code threshold} is pinned to {@link Integer#MAX_VALUE} so that
+   * no further resize is attempted.
+   *
+   * <p>Uses reflection to set {@code capacity} and {@code threshold} to the
+   * boundary values without allocating a multi-gigabyte backing array.
+   */
+  @Test
+  public void testResizeDoesNotOverflowAtMaximumCapacity() throws Exception {
+    final int maximumCapacity = 1 << 30;
+
+    // Start with a modest table; we'll forge the capacity field via reflection.
+    StringHashTableDictionaryV2 dict = new StringHashTableDictionaryV2(4, 1.0f);
+
+    // Inject capacity = MAXIMUM_CAPACITY, mask, and threshold = 0 so that the
+    // very next add() call will invoke resize() with capacity == MAXIMUM_CAPACITY.
+    java.lang.reflect.Field capField =
+        StringHashTableDictionaryV2.class.getDeclaredField("capacity");
+    capField.setAccessible(true);
+    capField.setInt(dict, maximumCapacity);
+
+    java.lang.reflect.Field maskField =
+        StringHashTableDictionaryV2.class.getDeclaredField("mask");
+    maskField.setAccessible(true);
+    maskField.setInt(dict, maximumCapacity - 1);
+
+    java.lang.reflect.Field thrField =
+        StringHashTableDictionaryV2.class.getDeclaredField("threshold");
+    thrField.setAccessible(true);
+    thrField.setInt(dict, 0); // force resize() on the very next add
+
+    // add() must not throw NegativeArraySizeException or any other error.
+    dict.add(new Text("boundary-key"));
+
+    // threshold must have been pinned to Integer.MAX_VALUE.
+    assertEquals(Integer.MAX_VALUE, thrField.getInt(dict));
+
+    // The key must still be retrievable.
+    assertEquals(1, dict.size());
+    Text result = new Text();
+    dict.getText(result, 0);
+    assertEquals("boundary-key", result.toString());
+  }
 }
