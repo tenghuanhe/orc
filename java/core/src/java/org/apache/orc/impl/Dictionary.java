@@ -33,7 +33,8 @@ import java.nio.ByteBuffer;
 public interface Dictionary {
   enum IMPL {
     RBTREE,
-    HASH
+    HASH,
+    HASH_V2
   }
 
   int INITIAL_DICTIONARY_SIZE = 4096;

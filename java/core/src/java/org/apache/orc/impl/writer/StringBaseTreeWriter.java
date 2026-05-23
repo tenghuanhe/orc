@@ -77,6 +77,8 @@ public abstract class StringBaseTreeWriter extends TreeWriterBase {
         return new StringRedBlackTree(INITIAL_DICTIONARY_SIZE);
       case HASH:
         return new StringHashTableDictionary(INITIAL_DICTIONARY_SIZE);
+      case HASH_V2:
+        return new StringHashTableDictionaryV2(INITIAL_DICTIONARY_SIZE);
       default:
         throw new UnsupportedOperationException("Unknown implementation:" + dictImpl);
     }
